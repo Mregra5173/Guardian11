@@ -1,0 +1,4981 @@
+# Guardian11
+# -*- coding: utf-8 -*-
+"""
+Guardian Web v4.0 Integrado
+- Combina o sistema web Flask com o sistema de codificação de peças
+- Mantém todas as funcionalidades originais do Guardian Web
+- Adiciona o sistema completo de codificação de peças
+- Interface unificada para todas as funcionalidades
+"""
+
+from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string, send_file
+from flask_cors import CORS
+import pymysql
+import sqlite3
+import os
+import io
+import logging
+import platform
+import subprocess
+import unicodedata
+import re
+import sys
+import traceback
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional, Union
+from enum import Enum
+from functools import wraps
+
+# ---------------------------
+# CONFIG
+# ---------------------------
+APP_VERSION = "4.0 Integrado"
+HOST = "0.0.0.0"
+PORT = 5001
+
+# Configuração do banco de dados MySQL (Guardian Web)
+DB_MYSQL = dict(
+    host="localhost",
+    user="root",
+    password="Hvelho2020",
+    database="guardian",
+    charset="utf8mb4",
+    cursorclass=pymysql.cursors.DictCursor
+)
+
+# Configuração do banco de dados SQLite (Sistema de Peças)
+DB_SQLITE = 'guardian_pecas.db'
+
+ROOT_LOCAL = r"D:\9Engenharia"
+ROOT_SHARE = r"\\Servidor\Engenharia"
+ALLOWED_REGISTRAR_ROLES = {"Admin", "Lafaiete"}
+
+# Pastas de processo padrão
+PROCESS_FOLDERS = ["Montagem","Fundição", "Laser", "Manuals", "Oxicorte", "Usinagem"]
+
+app = Flask(__name__)
+app.secret_key = "guardian-web-secret"
+CORS(app)
+
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('guardian_web.log'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------
+# ENUMS E DATACLASSES (Sistema de Peças)
+# ---------------------------
+
+class StatusCAD(Enum):
+    PENDENTE = "Pendente"
+    APROVADO = "Aprovado"
+    REPROVADO = "Reprovado"
+    VENCIDO = "Vencido"
+    EM_ANALISE = "Em Análise"
+
+class TipoDocumento(Enum):
+    CERTIFICADO_QUALIDADE = "Certificado de Qualidade"
+    LICENCA_OPERACAO = "Licença de Operação"
+    CERTIFICADO_BOMBAS = "Certificado de Bombas"
+    RELATORIO_TECNICO = "Relatório Técnico"
+    OUTRO = "Outro"
+
+@dataclass
+class DadosPeca:
+    nome: str
+    categoria: str
+    material: Optional[str] = None
+    peso: Optional[float] = None
+    observacoes: str = ""
+    data_criacao: str = ""
+    tipo_base: str = ""
+
+@dataclass
+class DadosFornecedor:
+    nome: str
+    contato: Optional[str] = None
+    email: Optional[str] = None
+    telefone: Optional[str] = None
+    endereco: Optional[str] = None
+    data_cadastro: str = ""
+
+@dataclass
+class DadosApelido:
+    codigo_apelido: str
+    tipo: str
+    descricao: str = ""
+
+@dataclass
+class DocumentoCAD:
+    id: int
+    tipo: str
+    nome_arquivo: str
+    data_upload: str
+    caminho_arquivo: str
+    observacoes: str = ""
+
+@dataclass
+class CertificadoCAD:
+    id: int
+    codigo_fornecedor: str
+    numero_cad: str
+    status: str
+    data_emissao: str
+    data_validade: str
+    escopo: str
+    observacoes: str = ""
+    documentos: List[DocumentoCAD] = None
+    
+    def __post_init__(self):
+        if self.documentos is None:
+            self.documentos = []
+
+# ---------------------------
+# SISTEMA DE CODIFICAÇÃO DE PEÇAS
+# ---------------------------
+class SistemaCodificacaoPecas:
+    def __init__(self, db_connect_fn=None):
+        """
+        Versão 100% MySQL do Sistema de Codificação de Peças.
+        Usa a função db_mysql() já configurada no Guardian WEB.
+        """
+        # função de conexão (por padrão usa db_mysql do próprio sistema)
+        self.db_connect_fn = db_connect_fn or db_mysql
+
+        # caches em memória
+        self.contadores_tipo = {}
+        self.pecas = {}
+        self.apelidos = {}
+        self.fornecedores = {}
+        self.codigos_fornecedor = {}
+        self.certificados_cad = {}
+        self.cads_fornecedor = {}
+
+        # mesmas normas que já existiam na versão SQLite
+        self.normas = {
+            '912':  {'nome': 'DIN 912 / ISO 4762',   'desc': 'Parafuso Allen cabeça cilíndrica'},
+            '933':  {'nome': 'DIN 933 / ISO 4017',   'desc': 'Parafuso sextavado rosca total'},
+            '931':  {'nome': 'DIN 931 / ISO 4014',   'desc': 'Parafuso sextavado rosca parcial'},
+            '7991': {'nome': 'DIN 7991 / ISO 10642', 'desc': 'Parafuso Allen escareado'},
+            '965':  {'nome': 'DIN 965',              'desc': 'Parafuso fenda cabeça escareada'},
+            '963':  {'nome': 'DIN 963',              'desc': 'Parafuso fenda cabeça cilíndrica'},
+            '934':  {'nome': 'DIN 934 / ISO 4032',   'desc': 'Porca sextavada'},
+            '985':  {'nome': 'DIN 985',              'desc': 'Porca autotravante'},
+            '6923': {'nome': 'DIN 6923',             'desc': 'Porca flangeada'},
+            '125':  {'nome': 'DIN 125 / ISO 7089',   'desc': 'Arruela lisa'},
+            '127':  {'nome': 'DIN 127',              'desc': 'Arruela pressão'},
+            '6798': {'nome': 'DIN 6798',             'desc': 'Arruela dentada'},
+            '6885': {'nome': 'DIN 6885',             'desc': 'Chaveta paralela'},
+            '471':  {'nome': 'DIN 471',              'desc': 'Anel elástico para eixo'},
+            '472':  {'nome': 'DIN 472',              'desc': 'Anel elástico para furo'},
+        }
+
+        # cria tabelas (idempotente) e carrega cache
+        self._criar_tabelas_mysql()
+        print("🔄 Inicializando Sistema de Codificação de Peças (MySQL)...")
+        self.carregar_dados()
+        print("✅ Sistema de codificação (MySQL) inicializado!")
+
+    # -------------------------------------------------
+    # helpers de banco
+    # -------------------------------------------------
+    def _execute(self, sql, params=None, fetch=False, many=False):
+        con = None
+        try:
+            con = self.db_connect_fn()
+            cur = con.cursor()
+            if many:
+                cur.executemany(sql, params or [])
+            else:
+                cur.execute(sql, params or ())
+            rows = cur.fetchall() if fetch else None
+            con.commit()
+            cur.close()
+            return rows
+        except Exception as e:
+            if con:
+                con.rollback()
+            print(f"❌ Erro SQL: {e}")
+            raise
+        finally:
+            if con:
+                con.close()
+
+    def _criar_tabelas_mysql(self):
+        """
+        Cria as tabelas específicas do sistema de peças/CAD no banco guardian.
+        Usa CREATE TABLE IF NOT EXISTS para não quebrar nada do que já existe.
+        """
+        ddls = [
+            # peças codificadas
+            """
+            CREATE TABLE IF NOT EXISTS pecas_codificacao (
+                codigo_guardian VARCHAR(64) NOT NULL PRIMARY KEY,
+                nome TEXT NOT NULL,
+                categoria VARCHAR(128) NOT NULL,
+                material VARCHAR(128),
+                peso DOUBLE,
+                observacoes TEXT,
+                data_criacao DATETIME NOT NULL,
+                tipo_base VARCHAR(16) NOT NULL,
+                dono_atual VARCHAR(64) DEFAULT '',
+                versao_atual INT DEFAULT 1,
+                momento_atual CHAR(1) DEFAULT 'S',
+                INDEX idx_tipo_base (tipo_base),
+                INDEX idx_categoria (categoria(50))
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            # apelidos
+            """
+            CREATE TABLE IF NOT EXISTS apelidos (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                codigo_apelido VARCHAR(64) NOT NULL UNIQUE,
+                codigo_guardian VARCHAR(64) NOT NULL,
+                tipo VARCHAR(32) NOT NULL,
+                descricao TEXT NOT NULL,
+                data_criacao DATETIME NOT NULL,
+                FOREIGN KEY (codigo_guardian) REFERENCES pecas_codificacao (codigo_guardian) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            # fornecedores (se já existir, esse CREATE IF NOT EXISTS é ignorado)
+            """
+            CREATE TABLE IF NOT EXISTS fornecedores (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                codigo_fornecedor VARCHAR(100) NOT NULL,
+                nome VARCHAR(120) NOT NULL UNIQUE,
+                contato VARCHAR(255),
+                email VARCHAR(255),
+                telefone VARCHAR(100),
+                endereco TEXT,
+                data_cadastro DATETIME NOT NULL,
+                INDEX idx_codigo_fornecedor (codigo_fornecedor)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            # associações peça x fornecedor
+            """
+            CREATE TABLE IF NOT EXISTS associacoes (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                codigo_guardian VARCHAR(64) NOT NULL,
+                codigo_fornecedor VARCHAR(100) NOT NULL,
+                codigo_forn_peca VARCHAR(128) NOT NULL,
+                data_associacao DATETIME NOT NULL,
+                preco DOUBLE,
+                prazo VARCHAR(128),
+                UNIQUE KEY uniq_fornpeca (codigo_fornecedor, codigo_forn_peca),
+                FOREIGN KEY (codigo_guardian) REFERENCES pecas_codificacao (codigo_guardian) ON DELETE CASCADE,
+                FOREIGN KEY (codigo_fornecedor) REFERENCES fornecedores (codigo_fornecedor) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            # contadores de tipo_base
+            """
+            CREATE TABLE IF NOT EXISTS contadores (
+                tipo_base VARCHAR(16) PRIMARY KEY,
+                contador INT DEFAULT 0
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            # certificados CAD
+            """
+            CREATE TABLE IF NOT EXISTS certificados_cad (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                codigo_fornecedor VARCHAR(100) NOT NULL,
+                numero_cad VARCHAR(128) NOT NULL UNIQUE,
+                status VARCHAR(32) NOT NULL,
+                data_emissao DATE NOT NULL,
+                data_validade DATE NOT NULL,
+                escopo TEXT NOT NULL,
+                observacoes TEXT,
+                data_criacao DATETIME NOT NULL,
+                FOREIGN KEY (codigo_fornecedor) REFERENCES fornecedores (codigo_fornecedor) ON DELETE CASCADE,
+                INDEX idx_data_validade (data_validade)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            # documentos do CAD
+            """
+            CREATE TABLE IF NOT EXISTS documentos_cad (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                id_certificado INT NOT NULL,
+                tipo VARCHAR(64) NOT NULL,
+                nome_arquivo VARCHAR(255) NOT NULL,
+                caminho_arquivo TEXT NOT NULL,
+                data_upload DATETIME NOT NULL,
+                observacoes TEXT,
+                FOREIGN KEY (id_certificado) REFERENCES certificados_cad (id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        ]
+        for ddl in ddls:
+            try:
+                self._execute(ddl)
+            except Exception:
+                # se der erro em um CREATE específico, não derrubamos o sistema
+                pass
+
+    # -------------------------------------------------
+    # normalização / geração de códigos
+    # -------------------------------------------------
+    def _normalize_text(self, text):
+        nfkd_form = unicodedata.normalize('NFKD', str(text))
+        return ''.join([c for c in nfkd_form if not unicodedata.combining(c)]).upper()
+
+    def _extrair_informacoes_peca(self, nome_peca):
+        nome_normalizado = self._normalize_text(nome_peca)
+        palavras_ignorar = ['DE', 'DA', 'DO', 'DOS', 'DAS', 'E', 'A', 'O', 'EM', 'PARA', 'COM', 'SEM']
+        palavras = re.findall(r'[A-Z]+', nome_normalizado)
+        palavras_filtradas = [p for p in palavras if p not in palavras_ignorar and len(p) > 1]
+
+        if not palavras_filtradas:
+            return "PEC", "XX"
+
+        if len(palavras_filtradas) >= 3:
+            iniciais = palavras_filtradas[0][0] + palavras_filtradas[1][0] + palavras_filtradas[2][0]
+        elif len(palavras_filtradas) == 2:
+            iniciais = palavras_filtradas[0][0] + palavras_filtradas[1][0] + "X"
+        else:
+            iniciais = palavras_filtradas[0][:3]
+            if len(iniciais) < 3:
+                iniciais = iniciais + "X" * (3 - len(iniciais))
+
+        sufixo = ""
+        palavras_sufixo = ['COMPRADA', 'USINADA', 'FUNDIDA', 'ESTAMPADA', 'TORNEADA', 'RETIFICADA']
+
+        for palavra in palavras:
+            if palavra in palavras_sufixo:
+                sufixo = palavra[:2]
+                break
+
+        if not sufixo:
+            for palavra in palavras:
+                if any(palavra.startswith(prefixo) for prefixo in ['COMP', 'USIN', 'FUND', 'EST', 'TOR', 'RET']):
+                    sufixo = palavra[:2]
+                    break
+
+        if not sufixo:
+            sufixo = "XX"
+
+        return iniciais, sufixo
+
+    def _gerar_codigo_apelido_norma(self, codigo_norma, diametro, comprimento):
+        if codigo_norma not in self.normas:
+            raise ValueError(f"Norma {codigo_norma} não encontrada")
+        norma_info = self.normas[codigo_norma]
+        codigo = f"{codigo_norma}{int(diametro):02d}{int(comprimento):03d}"
+        return codigo, f"{norma_info['nome']} M{diametro}×{comprimento}mm"
+
+    def _gerar_codigo_apelido_3letras(self, sigla, diametro, comprimento):
+        sigla = self._normalize_text(sigla)
+        sigla = re.sub(r'[^A-Z]', '', sigla)[:3]
+        if len(sigla) < 3:
+            sigla = sigla + "X" * (3 - len(sigla))
+        codigo = f"{sigla}{int(diametro):02d}{int(comprimento):03d}"
+        return codigo, f"{sigla} Ø{diametro}×{comprimento}mm"
+
+    def _gerar_codigo_apelido_descritivo(self, descricao, diametro, comprimento):
+        descricao = self._normalize_text(descricao)
+        descricao = re.sub(r'[^A-Z]', '', descricao)[:8]
+        if len(descricao) < 8:
+            descricao = descricao + "X" * (8 - len(descricao))
+        codigo = f"{descricao}{int(diametro):02d}{int(comprimento):03d}"
+        return codigo, f"{descricao} Ø{diametro}×{comprimento}mm"
+
+    # -------------------------------------------------
+    # carregamento dos dados em cache
+    # -------------------------------------------------
+    def carregar_dados(self):
+        # contadores
+        rows = self._execute("SELECT tipo_base, contador FROM contadores", fetch=True) or []
+        self.contadores_tipo = {r['tipo_base']: r['contador'] for r in rows}
+
+        # peças
+        rows = self._execute("""
+            SELECT codigo_guardian, nome, categoria, material, peso, observacoes, data_criacao, tipo_base
+            FROM pecas_codificacao
+        """, fetch=True) or []
+        self.pecas = {}
+        for r in rows:
+            cg = r['codigo_guardian']
+            dados = DadosPeca(
+                nome=r['nome'],
+                categoria=r['categoria'],
+                material=r.get('material'),
+                peso=r.get('peso'),
+                observacoes=r.get('observacoes') or "",
+                data_criacao=str(r.get('data_criacao')),
+                tipo_base=r.get('tipo_base')
+            )
+            self.pecas[cg] = {'dados': dados, 'apelidos': [], 'fornecedores': {}}
+
+        # apelidos
+        rows = self._execute("""
+            SELECT codigo_apelido, tipo, descricao, data_criacao, codigo_guardian
+            FROM apelidos
+        """, fetch=True) or []
+        self.apelidos = {}
+        for r in rows:
+            ca = r['codigo_apelido']
+            cg = r['codigo_guardian']
+            self.apelidos[ca] = cg
+            if cg in self.pecas:
+                self.pecas[cg]['apelidos'].append({
+                    'codigo_apelido': ca,
+                    'tipo': r['tipo'],
+                    'descricao': r['descricao'],
+                    'data_criacao': str(r['data_criacao'])
+                })
+
+        # fornecedores
+        rows = self._execute("""
+            SELECT codigo_fornecedor, nome, contato, email, telefone, endereco, data_cadastro
+            FROM fornecedores
+        """, fetch=True) or []
+        self.fornecedores = {}
+        for r in rows:
+            cod = r['codigo_fornecedor']
+            self.fornecedores[cod] = DadosFornecedor(
+                nome=r['nome'],
+                contato=r.get('contato'),
+                email=r.get('email'),
+                telefone=r.get('telefone'),
+                endereco=r.get('endereco'),
+                data_cadastro=str(r.get('data_cadastro'))
+            )
+
+        # associações
+        rows = self._execute("""
+            SELECT codigo_guardian, codigo_fornecedor, codigo_forn_peca, data_associacao, preco, prazo
+            FROM associacoes
+        """, fetch=True) or []
+        self.codigos_fornecedor = {}
+        for r in rows:
+            cg = r['codigo_guardian']
+            cf = r['codigo_fornecedor']
+            cfp = r['codigo_forn_peca']
+            self.codigos_fornecedor[(cf, cfp)] = cg
+            if cg in self.pecas:
+                if cf not in self.pecas[cg]['fornecedores']:
+                    self.pecas[cg]['fornecedores'][cf] = []
+                self.pecas[cg]['fornecedores'][cf].append({
+                    'codigo': cfp,
+                    'data_associacao': str(r['data_associacao']),
+                    'preco': r.get('preco'),
+                    'prazo': r.get('prazo')
+                })
+
+        # CAD
+        self._carregar_certificados_cad()
+        print("📂 Dados do sistema de peças/CAD carregados do MySQL guardian.")
+
+    def _carregar_certificados_cad(self):
+        rows = self._execute("""
+            SELECT id, codigo_fornecedor, numero_cad, status, data_emissao, data_validade, escopo, observacoes
+            FROM certificados_cad
+        """, fetch=True) or []
+        self.certificados_cad = {}
+        self.cads_fornecedor = {}
+
+        for r in rows:
+            id_cert = r['id']
+            cert = CertificadoCAD(
+                id=id_cert,
+                codigo_fornecedor=r['codigo_fornecedor'],
+                numero_cad=r['numero_cad'],
+                status=r['status'],
+                data_emissao=str(r['data_emissao']),
+                data_validade=str(r['data_validade']),
+                escopo=r['escopo'],
+                observacoes=r.get('observacoes') or ""
+            )
+            # documentos
+            docs = self._execute("""
+                SELECT id, tipo, nome_arquivo, caminho_arquivo, data_upload, observacoes
+                FROM documentos_cad
+                WHERE id_certificado = %s
+            """, (id_cert,), fetch=True) or []
+            for d in docs:
+                doc = DocumentoCAD(
+                    id=d['id'],
+                    tipo=d['tipo'],
+                    nome_arquivo=d['nome_arquivo'],
+                    caminho_arquivo=d['caminho_arquivo'],
+                    data_upload=str(d['data_upload']),
+                    observacoes=d.get('observacoes') or ""
+                )
+                cert.documentos.append(doc)
+            self.certificados_cad[id_cert] = cert
+            self.cads_fornecedor.setdefault(r['codigo_fornecedor'], []).append(id_cert)
+
+    # -------------------------------------------------
+    # operações principais (mesma API da versão SQLite)
+    # -------------------------------------------------
+    def criar_peca(self, nome, categoria=None, material=None, peso=None, observacoes=""):
+        iniciais, sufixo = self._extrair_informacoes_peca(nome)
+        base_tipo = iniciais + sufixo
+
+        # controla contador com LOCK de linha
+        con = self.db_connect_fn()
+        try:
+            cur = con.cursor()
+            cur.execute(
+                "SELECT contador FROM contadores WHERE tipo_base = %s FOR UPDATE",
+                (base_tipo,)
+            )
+            row = cur.fetchone()
+            if row:
+                sequencial = row['contador'] + 1
+                cur.execute(
+                    "UPDATE contadores SET contador = %s WHERE tipo_base = %s",
+                    (sequencial, base_tipo)
+                )
+            else:
+                sequencial = 1
+                cur.execute(
+                    "INSERT INTO contadores (tipo_base, contador) VALUES (%s, %s)",
+                    (base_tipo, sequencial)
+                )
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            cur.close()
+            con.close()
+
+        codigo_guardian = f"{base_tipo}{sequencial:03d}"
+        data_criacao = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        self._execute("""
+            INSERT INTO pecas_codificacao
+            (codigo_guardian, nome, categoria, material, peso, observacoes, data_criacao, tipo_base)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (codigo_guardian, nome, categoria or "Geral", material, peso, observacoes, data_criacao, base_tipo))
+
+        dados_peca = DadosPeca(
+            nome=nome,
+            categoria=categoria or "Geral",
+            material=material,
+            peso=peso,
+            observacoes=observacoes,
+            data_criacao=data_criacao,
+            tipo_base=base_tipo
+        )
+        self.pecas[codigo_guardian] = {
+            'dados': dados_peca,
+            'apelidos': [],
+            'fornecedores': {}
+        }
+        self.contadores_tipo[base_tipo] = sequencial
+
+        return codigo_guardian, dados_peca
+
+    def adicionar_apelido(self, codigo_guardian, tipo_apelido, **kwargs):
+        # verifica peça
+        if not self._execute(
+            "SELECT 1 FROM pecas_codificacao WHERE codigo_guardian = %s",
+            (codigo_guardian,), fetch=True
+        ):
+            raise ValueError("Código Guardian não encontrado")
+
+        if tipo_apelido == 'norma':
+            codigo_norma = kwargs.get('codigo_norma')
+            diametro = kwargs.get('diametro')
+            comprimento = kwargs.get('comprimento')
+            if not all([codigo_norma, diametro, comprimento]):
+                raise ValueError("Para apelido por norma, informe código_norma, diametro e comprimento")
+            codigo_apelido, descricao = self._gerar_codigo_apelido_norma(codigo_norma, diametro, comprimento)
+
+        elif tipo_apelido == '3letras':
+            sigla = kwargs.get('sigla')
+            diametro = kwargs.get('diametro')
+            comprimento = kwargs.get('comprimento')
+            if not all([sigla, diametro, comprimento]):
+                raise ValueError("Para apelido por 3 letras, informe sigla, diametro e comprimento")
+            codigo_apelido, descricao = self._gerar_codigo_apelido_3letras(sigla, diametro, comprimento)
+
+        elif tipo_apelido == 'descritivo':
+            descricao_texto = kwargs.get('descricao')
+            diametro = kwargs.get('diametro')
+            comprimento = kwargs.get('comprimento')
+            if not all([descricao_texto, diametro, comprimento]):
+                raise ValueError("Para apelido descritivo, informe descricao, diametro e comprimento")
+            codigo_apelido, descricao = self._gerar_codigo_apelido_descritivo(descricao_texto, diametro, comprimento)
+        else:
+            raise ValueError("Tipo de apelido inválido")
+
+        # checa duplicidade
+        if self._execute(
+            "SELECT 1 FROM apelidos WHERE codigo_apelido = %s",
+            (codigo_apelido,), fetch=True
+        ):
+            raise ValueError(f"Código apelido {codigo_apelido} já existe")
+
+        data_criacao = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self._execute("""
+            INSERT INTO apelidos (codigo_apelido, codigo_guardian, tipo, descricao, data_criacao)
+            VALUES (%s,%s,%s,%s,%s)
+        """, (codigo_apelido, codigo_guardian, tipo_apelido, descricao, data_criacao))
+
+        self.apelidos[codigo_apelido] = codigo_guardian
+        if codigo_guardian in self.pecas:
+            self.pecas[codigo_guardian]['apelidos'].append({
+                'codigo_apelido': codigo_apelido,
+                'tipo': tipo_apelido,
+                'descricao': descricao,
+                'data_criacao': data_criacao
+            })
+
+        return codigo_apelido, descricao
+
+    def cadastrar_fornecedor(self, codigo_fornecedor, nome, **kwargs):
+        if self._execute(
+            "SELECT 1 FROM fornecedores WHERE codigo_fornecedor = %s",
+            (codigo_fornecedor,), fetch=True
+        ):
+            raise ValueError("Fornecedor já cadastrado")
+
+        data_cadastro = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self._execute("""
+            INSERT INTO fornecedores
+            (codigo_fornecedor, nome, contato, email, telefone, endereco, data_cadastro)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            codigo_fornecedor,
+            nome,
+            kwargs.get('contato'),
+            kwargs.get('email'),
+            kwargs.get('telefone'),
+            kwargs.get('endereco'),
+            data_cadastro
+        ))
+
+        self.fornecedores[codigo_fornecedor] = DadosFornecedor(
+            nome=nome,
+            contato=kwargs.get('contato'),
+            email=kwargs.get('email'),
+            telefone=kwargs.get('telefone'),
+            endereco=kwargs.get('endereco'),
+            data_cadastro=data_cadastro
+        )
+def associar_fornecedor_peca(self, codigo_guardian, codigo_fornecedor, codigo_forn_peca, **kwargs):
+    """
+    Registra um fornecimento para uma peça Guardian.
+
+    REGRAS:
+    - Não exige que o fornecedor exista em nenhuma tabela.
+    - Usa apenas a tabela `associacoes` como registro de fornecimento.
+    - Garante que:
+        * o código Guardian existe;
+        * a combinação (codigo_fornecedor, codigo_forn_peca) não esteja duplicada.
+    """
+
+    # 1) Garante que a peça existe
+    existe = self._execute(
+        "SELECT 1 FROM pecas_codificacao WHERE codigo_guardian = %s",
+        (codigo_guardian,),
+        fetch=True
+    )
+    if not existe:
+        raise ValueError("Código Guardian não encontrado")
+
+    # 2) NÃO verifica mais fornecedor na tabela `fornecedores`
+    #    Apenas impede duplicidade da combinação (fornecedor + código peça do fornecedor)
+    duplicado = self._execute(
+        "SELECT 1 FROM associacoes WHERE codigo_fornecedor = %s AND codigo_forn_peca = %s",
+        (codigo_fornecedor, codigo_forn_peca),
+        fetch=True
+    )
+    if duplicado:
+        raise ValueError("Código de fornecedor já associado")
+
+    # 3) Grava registro de fornecimento
+    data_associacao = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    self._execute(
+        """
+        INSERT INTO associacoes
+        (codigo_guardian, codigo_fornecedor, codigo_forn_peca, data_associacao, preco, prazo)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (
+            codigo_guardian,
+            codigo_fornecedor,
+            codigo_forn_peca,
+            data_associacao,
+            kwargs.get('preco'),
+            kwargs.get('prazo'),
+        )
+    )
+
+    # 4) Atualiza cache em memória
+    self.codigos_fornecedor[(codigo_fornecedor, codigo_forn_peca)] = codigo_guardian
+
+    if codigo_guardian in self.pecas:
+        if codigo_fornecedor not in self.pecas[codigo_guardian]['fornecedores']:
+            self.pecas[codigo_guardian]['fornecedores'][codigo_fornecedor] = []
+
+        self.pecas[codigo_guardian]['fornecedores'][codigo_fornecedor].append({
+            'codigo': codigo_forn_peca,
+            'data_associacao': data_associacao,
+            'preco': kwargs.get('preco'),
+            'prazo': kwargs.get('prazo')
+        })
+
+
+    def buscar_por_guardian(self, codigo_guardian):
+        if codigo_guardian in self.pecas:
+            return self.pecas[codigo_guardian]
+        # tenta carregar direto do banco se não estiver no cache
+        row = self._execute("""
+            SELECT codigo_guardian, nome, categoria, material, peso, observacoes, data_criacao, tipo_base
+            FROM pecas_codificacao
+            WHERE codigo_guardian = %s
+        """, (codigo_guardian,), fetch=True)
+        if row:
+            r = row[0]
+            dados = DadosPeca(
+                nome=r['nome'],
+                categoria=r['categoria'],
+                material=r.get('material'),
+                peso=r.get('peso'),
+                observacoes=r.get('observacoes') or "",
+                data_criacao=str(r.get('data_criacao')),
+                tipo_base=r.get('tipo_base')
+            )
+            self.pecas[codigo_guardian] = {
+                'dados': dados,
+                'apelidos': [],
+                'fornecedores': {}
+            }
+            return self.pecas[codigo_guardian]
+        return None
+
+    def buscar_por_apelido(self, codigo_apelido):
+        if codigo_apelido in self.apelidos:
+            cg = self.apelidos[codigo_apelido]
+            return self.buscar_por_guardian(cg)
+        row = self._execute(
+            "SELECT codigo_guardian FROM apelidos WHERE codigo_apelido = %s",
+            (codigo_apelido,), fetch=True
+        )
+        if row:
+            cg = row[0]['codigo_guardian']
+            self.apelidos[codigo_apelido] = cg
+            return self.buscar_por_guardian(cg)
+        return None
+
+    def buscar_por_fornecedor(self, codigo_fornecedor, codigo_forn_peca):
+        chave = (codigo_fornecedor, codigo_forn_peca)
+        if chave in self.codigos_fornecedor:
+            return self.buscar_por_guardian(self.codigos_fornecedor[chave])
+        row = self._execute("""
+            SELECT codigo_guardian
+            FROM associacoes
+            WHERE codigo_fornecedor = %s AND codigo_forn_peca = %s
+        """, (codigo_fornecedor, codigo_forn_peca), fetch=True)
+        if row:
+            cg = row[0]['codigo_guardian']
+            self.codigos_fornecedor[chave] = cg
+            return self.buscar_por_guardian(cg)
+        return None
+
+    def pesquisar_pecas(self, termo=None, filtros=None):
+        resultados = []
+        for cg, p in self.pecas.items():
+            dados = p['dados']
+            if termo:
+                termo_upper = self._normalize_text(termo)
+                if not (
+                    termo_upper in self._normalize_text(dados.nome)
+                    or termo_upper in self._normalize_text(dados.categoria)
+                    or (dados.material and termo_upper in self._normalize_text(dados.material))
+                ):
+                    continue
+            if filtros:
+                if filtros.get('categoria') and filtros['categoria'] != dados.categoria:
+                    continue
+                if filtros.get('material') and filtros['material'] != dados.material:
+                    continue
+                if filtros.get('data_inicio') and str(dados.data_criacao) < filtros['data_inicio']:
+                    continue
+                if filtros.get('data_fim') and str(dados.data_criacao) > filtros['data_fim']:
+                    continue
+            resultados.append({
+                'codigo_guardian': cg,
+                'dados': dados,
+                'apelidos': p['apelidos'],
+                'fornecedores': p['fornecedores']
+            })
+        return resultados
+def obter_informacoes_completas(self, codigo_guardian):
+    """
+    Retorna as informações completas de uma peça Guardian:
+
+      - dados principais (nome, categoria, material, peso, etc.)
+      - lista de apelidos
+      - lista de registros de fornecimento
+
+    Mesmo se o fornecedor NÃO estiver cadastrado na estrutura self.fornecedores,
+    os registros de fornecimento são retornados (sem dados de nome/contato).
+    """
+
+    # Garante que a peça esteja no cache; caso não esteja, tenta carregar do banco
+    if codigo_guardian not in self.pecas:
+        if not self.buscar_por_guardian(codigo_guardian):
+            return None
+
+    p = self.pecas[codigo_guardian]
+    d = p['dados']
+
+    info = {
+        'codigo_guardian': codigo_guardian,
+        'nome': d.nome,
+        'categoria': d.categoria,
+        'material': d.material,
+        'peso': d.peso,
+        'observacoes': d.observacoes,
+        'data_criacao': d.data_criacao,
+        'tipo_base': d.tipo_base,
+    }
+
+    if hasattr(d, 'codigo_pai'):
+        info['codigo_pai'] = d.codigo_pai
+
+    info['apelidos'] = []
+    info['fornecedores'] = []
+
+    # -------------------------
+    # Apelidos
+    # -------------------------
+    for ap in p['apelidos']:
+        info['apelidos'].append({
+            'codigo_apelido': ap['codigo_apelido'],
+            'tipo': ap['tipo'],
+            'descricao': ap['descricao'],
+            'data_criacao': ap['data_criacao']
+        })
+
+    # -------------------------
+    # Fornecimentos (associacoes)
+    # -------------------------
+    for cod_forn, assoc_list in p['fornecedores'].items():
+        fornecedor = self.fornecedores.get(cod_forn, None)  # pode ser None
+
+        for assoc in assoc_list:
+            # base: sempre retorna isso
+            f_info = {
+                'codigo_fornecedor': cod_forn,
+                'codigo_peca': assoc['codigo'],
+                'data_associacao': assoc['data_associacao'],
+                'preco': assoc.get('preco'),
+                'prazo': assoc.get('prazo')
+            }
+
+            # Se o fornecedor existir (tabela/estrutura opcional), complementa
+            if fornecedor:
+                f_info.update({
+                    'nome_fornecedor': getattr(fornecedor, 'nome', None),
+                    'contato': getattr(fornecedor, 'contato', None),
+                    'email': getattr(fornecedor, 'email', None),
+                    'telefone': getattr(fornecedor, 'telefone', None)
+                })
+
+                try:
+                    cads = self.obter_cads_fornecedor(cod_forn)
+                except Exception:
+                    cads = None
+
+                if cads:
+                    f_info['certificados_cad'] = []
+                    for cad in cads:
+                        f_info['certificados_cad'].append({
+                            'numero_cad': cad.numero_cad,
+                            'status': cad.status,
+                            'data_validade': cad.data_validade,
+                            'escopo': cad.escopo
+                        })
+
+            info['fornecedores'].append(f_info)
+
+    return info
+
+
+    def listar_todas_pecas(self):
+        return list(self.pecas.keys())
+
+    def listar_fornecedores(self):
+        return [(cod, forn.nome) for cod, forn in self.fornecedores.items()]
+
+    def excluir_peca(self, codigo_guardian):
+        self._execute(
+            "DELETE FROM pecas_codificacao WHERE codigo_guardian = %s",
+            (codigo_guardian,)
+        )
+        if codigo_guardian in self.pecas:
+            del self.pecas[codigo_guardian]
+        to_remove_ap = [ap for ap, cg in self.apelidos.items() if cg == codigo_guardian]
+        for ap in to_remove_ap:
+            del self.apelidos[ap]
+        to_remove_assoc = [k for k, cg in self.codigos_fornecedor.items() if cg == codigo_guardian]
+        for k in to_remove_assoc:
+            del self.codigos_fornecedor[k]
+
+    # ---------------- CAD (MySQL) ----------------
+    def cadastrar_certificado_cad(self, codigo_fornecedor, numero_cad, data_emissao, data_validade, escopo, observacoes=""):
+        if not self._execute(
+            "SELECT 1 FROM fornecedores WHERE codigo_fornecedor = %s",
+            (codigo_fornecedor,), fetch=True
+        ):
+            raise ValueError("Fornecedor não encontrado")
+
+        if self._execute(
+            "SELECT 1 FROM certificados_cad WHERE numero_cad = %s",
+            (numero_cad,), fetch=True
+        ):
+            raise ValueError(f"Número CAD {numero_cad} já existe")
+
+        status = StatusCAD.EM_ANALISE.value
+        data_criacao = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self._execute("""
+            INSERT INTO certificados_cad
+            (codigo_fornecedor, numero_cad, status, data_emissao, data_validade, escopo, observacoes, data_criacao)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            codigo_fornecedor,
+            numero_cad,
+            status,
+            data_emissao,
+            data_validade,
+            escopo,
+            observacoes,
+            data_criacao
+        ))
+
+        # pega o id inserido
+        row = self._execute("SELECT LAST_INSERT_ID() AS id", fetch=True)
+        id_cert = row[0]['id']
+        cert = CertificadoCAD(
+            id=id_cert,
+            codigo_fornecedor=codigo_fornecedor,
+            numero_cad=numero_cad,
+            status=status,
+            data_emissao=data_emissao,
+            data_validade=data_validade,
+            escopo=escopo,
+            observacoes=observacoes
+        )
+        self.certificados_cad[id_cert] = cert
+        self.cads_fornecedor.setdefault(codigo_fornecedor, []).append(id_cert)
+        return id_cert, cert
+
+    def adicionar_documento_cad(self, id_certificado, tipo_documento, nome_arquivo, caminho_arquivo, observacoes=""):
+        if id_certificado not in self.certificados_cad:
+            raise ValueError("Certificado CAD não encontrado")
+        data_upload = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self._execute("""
+            INSERT INTO documentos_cad
+            (id_certificado, tipo, nome_arquivo, caminho_arquivo, data_upload, observacoes)
+            VALUES (%s,%s,%s,%s,%s,%s)
+        """, (
+            id_certificado,
+            tipo_documento,
+            nome_arquivo,
+            caminho_arquivo,
+            data_upload,
+            observacoes
+        ))
+        row = self._execute("SELECT LAST_INSERT_ID() AS id", fetch=True)
+        id_doc = row[0]['id']
+        doc = DocumentoCAD(
+            id=id_doc,
+            tipo=tipo_documento,
+            nome_arquivo=nome_arquivo,
+            caminho_arquivo=caminho_arquivo,
+            data_upload=data_upload,
+            observacoes=observacoes
+        )
+        self.certificados_cad[id_certificado].documentos.append(doc)
+        return id_doc, doc
+
+    def atualizar_status_cad(self, id_certificado, novo_status):
+        if id_certificado not in self.certificados_cad:
+            raise ValueError("Certificado CAD não encontrado")
+        self._execute(
+            "UPDATE certificados_cad SET status = %s WHERE id = %s",
+            (novo_status, id_certificado)
+        )
+        self.certificados_cad[id_certificado].status = novo_status
+        return True
+
+    def verificar_validade_cads(self):
+        hoje = datetime.now().date().isoformat()
+        rows = self._execute("""
+            SELECT id
+            FROM certificados_cad
+            WHERE data_validade < %s AND status != %s
+        """, (hoje, StatusCAD.VENCIDO.value), fetch=True) or []
+        for r in rows:
+            self.atualizar_status_cad(r['id'], StatusCAD.VENCIDO.value)
+        return len(rows)
+
+    def obter_cads_fornecedor(self, codigo_fornecedor):
+        ids = self.cads_fornecedor.get(codigo_fornecedor, [])
+        return [self.certificados_cad[i] for i in ids if i in self.certificados_cad]
+
+    def obter_cad_por_numero(self, numero_cad):
+        rows = self._execute(
+            "SELECT id FROM certificados_cad WHERE numero_cad = %s",
+            (numero_cad,), fetch=True
+        )
+        if rows:
+            return self.certificados_cad.get(rows[0]['id'])
+        return None
+
+    def listar_cads_vencendo(self, dias=30):
+        data_hoje = datetime.now().date().isoformat()
+        data_limite = (datetime.now() + timedelta(days=dias)).date().isoformat()
+        rows = self._execute("""
+            SELECT c.id, c.numero_cad, c.data_validade, f.nome
+            FROM certificados_cad c
+            JOIN fornecedores f ON c.codigo_fornecedor = f.codigo_fornecedor
+            WHERE c.data_validade BETWEEN %s AND %s
+              AND c.status = %s
+        """, (data_hoje, data_limite, StatusCAD.APROVADO.value), fetch=True) or []
+        return rows
+
+    def gerar_relatorio_cad(self):
+        stats = self._execute("""
+            SELECT status, COUNT(*) AS cnt
+            FROM certificados_cad
+            GROUP BY status
+        """, fetch=True) or []
+        por_status = {r['status']: r['cnt'] for r in stats}
+
+        vencidos_row = self._execute("""
+            SELECT COUNT(*) AS cnt
+            FROM certificados_cad
+            WHERE data_validade < CURDATE()
+              AND status = %s
+        """, (StatusCAD.APROVADO.value,), fetch=True) or []
+        vencidos = vencidos_row[0]['cnt'] if vencidos_row else 0
+
+        proximos_vencer = len(self.listar_cads_vencendo(30))
+
+        return {
+            'total_cads': len(self.certificados_cad),
+            'por_status': por_status,
+            'vencidos': vencidos,
+            'proximos_vencer': proximos_vencer,
+            'fornecedores_com_cad': len(self.cads_fornecedor)
+        }
+
+    def close(self):
+        # não mantém conexão aberta (usa conexões por chamada)
+        pass
+
+
+
+# ---------------------------
+# Cache de estrutura de tabelas (Guardian Web)
+# ---------------------------
+table_cache = {}
+
+def get_table_columns(table_name):
+    """Cache da estrutura das tabelas para evitar consultas repetidas"""
+    if table_name in table_cache:
+        return table_cache[table_name]
+    
+    try:
+        con = db_mysql()
+        with con.cursor() as cur:
+            cur.execute(f"DESCRIBE {table_name}")
+            columns = [col['Field'] for col in cur.fetchall()]
+        con.close()
+        table_cache[table_name] = columns
+        return columns
+    except Exception as e:
+        logger.error(f"Erro ao obter colunas da tabela {table_name}: {e}")
+        return []
+
+def has_column(table_name, column_name):
+    """Verifica se uma coluna existe em uma tabela"""
+    return column_name in get_table_columns(table_name)
+
+# ---------------------------
+# Helpers (Guardian Web)
+# ---------------------------
+def db_mysql():
+    return pymysql.connect(**DB_MYSQL)
+
+def norm2(txt):  # 2 chars upper
+    if txt is None: txt = ""
+    return (str(txt).upper() + "  ")[:2]
+
+def norm1(txt):  # 1 char upper
+    if txt is None: txt = ""
+    return (str(txt).upper() + " ")[:1]
+
+def norm3(txt):  # 3 chars upper
+    if txt is None: txt = ""
+    return (str(txt).upper() + "   ")[:3]
+
+def z2(n):  # 2 digits
+    return f"{str(n or '').strip():0>2}"[:2]
+
+def z3(n):  # 3 digits
+    return f"{str(n or '').strip():0>3}"[:3]
+
+def build_reference(sigla_eq, modelo, ramo, id_eq, sigla_cj, sigla_aux, id_cj, sigla_peca, origem, familia, id_peca):
+    ee = norm2(sigla_eq)
+    mm = norm2(modelo)
+    r  = norm1(ramo)
+    ide= z2(id_eq)
+    cj = norm2(sigla_cj)
+    a  = norm1(sigla_aux)
+    idc= z2(id_cj)
+    p  = norm3(sigla_peca)
+    o  = norm1(origem)
+    f  = norm1(familia)
+    idp= z3(id_peca)
+    return f"{ee}{mm}{r}{ide}{cj}{a}{idc}{p}{o}{f}{idp}"
+
+def ensure_dirs_by_name(cat_nome, sig_eq, modelo, ramo, id_eq):
+    categoria_folder = clean_folder_name(cat_nome)
+    ref_equipamento = f"{norm2(sig_eq)}{norm2(modelo)}{norm1(ramo)}{z2(id_eq)}"
+    full_path = os.path.join(ROOT_LOCAL, categoria_folder, ref_equipamento)
+    
+    os.makedirs(full_path, exist_ok=True)
+    
+    for process_folder in PROCESS_FOLDERS:
+        process_path = os.path.join(full_path, process_folder)
+        os.makedirs(process_path, exist_ok=True)
+    
+    return full_path
+
+def clean_folder_name(name):
+    if name is None:
+        return "SEM_NOME"
+    
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        name = name.replace(char, '')
+    
+    name = ' '.join(name.split())
+    name = name.replace(' ', '_')
+    
+    return name.strip()
+
+def get_user_machine_info():
+    machine_name = platform.node()
+    system = platform.system()
+    username = os.getenv('USERNAME') or os.getenv('USER')
+    
+    return {
+        "machine_name": machine_name,
+        "system": system,
+        "username": username
+    }
+
+def resolve_path_for_user(server_path):
+    return server_path
+
+def open_folder_in_explorer(path):
+    """Abre a pasta no explorador de arquivos do sistema"""
+    try:
+        logger.info(f"Tentando abrir pasta: {path}")
+        
+        # Verificar se o caminho existe
+        if not os.path.exists(path):
+            logger.error(f"Caminho não existe: {path}")
+            return False
+            
+        # Normalizar o caminho para o sistema operacional
+        path = os.path.normpath(path)
+        
+        if platform.system() == "Windows":
+            # No Windows, usar start explorer com o caminho entre aspas
+            subprocess.Popen(f'start explorer "{path}"', shell=True)
+        elif platform.system() == "Darwin":
+            # No macOS, usar open
+            subprocess.Popen(["open", path])
+        else:
+            # No Linux, usar xdg-open
+            subprocess.Popen(["xdg-open", path])
+        
+        logger.info(f"Pasta aberta com sucesso: {path}")
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao abrir pasta '{path}': {e}")
+        return False
+
+def to_share(path_local):
+    pl = path_local.replace("/", "\\")
+    rl = ROOT_LOCAL.replace("/", "\\")
+    if pl.upper().startswith(rl.upper()):
+        tail = pl[len(rl):].lstrip("\\/")
+        return ROOT_SHARE.rstrip("\\/") + "\\" + tail
+    return pl
+
+def is_admin():
+    role = (session.get("role") or "").strip()
+    nome = (session.get("user") or "").strip()
+    return (role in ALLOWED_REGISTRAR_ROLES) or (nome in ALLOWED_REGISTRAR_ROLES)
+
+def log_acao(acao, referencia=None, detalhes=""):
+    usuario = session.get("user", "desconhecido")
+    log_msg = f"USUARIO={usuario} | ACAO={acao} | REF={referencia} | {detalhes}"
+    logger.info(log_msg)
+
+def registrar_historico(referencia, fase, acao, valor_antigo, valor_novo, usuario, motivo=""):
+    """Só registra se a tabela auditoria existir e tiver a estrutura correta"""
+    try:
+        if not has_column('auditoria', 'referencia'):
+            return False
+            
+        con = db_mysql()
+        with con.cursor() as cur:
+            cur.execute("""
+                INSERT INTO auditoria 
+                (referencia, fase, acao, valor_antigo, valor_novo, data, usuario, motivo)
+                VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s)
+            """, (referencia, fase, acao, valor_antigo, valor_novo, usuario, motivo))
+        con.close()
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao registrar histórico: {e}")
+        return False
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get("user_id"):
+            return jsonify({"erro": "Não autenticado"}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+# ---------------------------
+# Verificação de recursos disponíveis
+# ---------------------------
+def check_available_features():
+    """Verifica quais recursos estão disponíveis no banco de dados"""
+    features = {
+        'has_novas_colunas': False,
+        'has_auditoria': False,
+        'has_steeltabel_completo': False
+    }
+    
+    try:
+        # Verificar colunas de controle
+        features['has_novas_colunas'] = (
+            has_column('keystone', 'dono_atual') and
+            has_column('keystone', 'versao_atual') and
+            has_column('keystone', 'momento_atual') and
+            has_column('conjuntos', 'dono_atual') and
+            has_column('conjuntos', 'versao_atual') and
+            has_column('conjuntos', 'momento_atual') and
+            has_column('pecas', 'dono_atual') and
+            has_column('pecas', 'versao_atual') and
+            has_column('pecas', 'momento_atual')
+        )
+        
+        # Verificar tabela de auditoria
+        features['has_auditoria'] = (
+            has_column('auditoria', 'referencia') and
+            has_column('auditoria', 'fase') and
+            has_column('auditoria', 'acao')
+        )
+        
+        # Verificar tabela steeltabel completa (baseado na estrutura real)
+        features['has_steeltabel_completo'] = (
+            has_column('steeltabel', 'tipo_origem') and
+            has_column('steeltabel', 'data_criacao') and
+            has_column('steeltabel', 'status_referencia')
+        )
+        
+    except Exception as e:
+        logger.error(f"Erro ao verificar recursos: {e}")
+    
+    return features
+
+# ---------------------------
+# AUTH
+# ---------------------------
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return render_template_string(LOGIN_HTML, versao=APP_VERSION, erro=None)
+
+    nome = (request.form.get("nome") or "").strip()
+    senha = (request.form.get("senha") or "").strip()
+    if not nome or not senha:
+        return render_template_string(LOGIN_HTML, versao=APP_VERSION, erro="Informe nome e senha.")
+
+    try:
+        con = db_mysql()
+        with con.cursor() as cur:
+            cur.execute("SELECT id, nome, senha, COALESCE(role,'') AS role FROM usuarios WHERE nome=%s LIMIT 1", (nome,))
+            u = cur.fetchone()
+        con.close()
+        if not u or (u.get("senha") or "") != senha:
+            return render_template_string(LOGIN_HTML, versao=APP_VERSION, erro="Credenciais inválidas.")
+        session["user_id"] = u["id"]
+        session["user"] = u["nome"]
+        session["role"] = u.get("role","")
+        log_acao("login", detalhes=f"usuário={nome}")
+        return redirect(url_for("index"))
+    except Exception as e:
+        logger.error(f"Erro no login: {e}")
+        return render_template_string(LOGIN_HTML, versao=APP_VERSION, erro=f"Erro no login: {e}")
+
+@app.route("/logout")
+def logout():
+    user = session.get("user", "desconhecido")
+    session.clear()
+    log_acao("logout", detalhes=f"usuário={user}")
+    return redirect(url_for("login"))
+
+# ---------------------------
+# PÁGINA PRINCIPAL
+# ---------------------------
+@app.route("/")
+def index():
+    if not session.get("user_id"):
+        return redirect(url_for("login"))
+    
+    # Verificar recursos disponíveis
+    features = check_available_features()
+    
+    return render_template_string(
+        APP_HTML, 
+        versao=APP_VERSION, 
+        user=session.get("user",""), 
+        role=session.get("role",""),
+        has_novas_colunas=features['has_novas_colunas']
+    )
+
+# ---------------------------
+# API: Sistema de Peças
+# ---------------------------
+@app.route("/api/pecas/criar", methods=["POST"])
+@login_required
+def api_criar_peca():
+    try:
+        data = request.json
+        nome = data.get('nome')
+        categoria = data.get('categoria')
+        material = data.get('material')
+        peso = data.get('peso')
+        observacoes = data.get('observacoes')
+        
+        codigo_guardian, dados_peca = sistema_pecas.criar_peca(
+            nome=nome,
+            categoria=categoria,
+            material=material,
+            peso=peso,
+            observacoes=observacoes
+        )
+        
+        log_acao("criar_peca", codigo_guardian, f"nome={nome}")
+        
+        return jsonify({
+            "sucesso": True,
+            "codigo_guardian": codigo_guardian,
+            "dados_peca": asdict(dados_peca)
+        })
+    except Exception as e:
+        logger.error(f"Erro ao criar peça: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/pecas/adicionar_apelido", methods=["POST"])
+@login_required
+def api_adicionar_apelido():
+    try:
+        data = request.json
+        codigo_guardian = data.get('codigo_guardian')
+        tipo_apelido = data.get('tipo_apelido')
+        
+        kwargs = {}
+        if tipo_apelido == 'norma':
+            kwargs['codigo_norma'] = data.get('codigo_norma')
+            kwargs['diametro'] = data.get('diametro')
+            kwargs['comprimento'] = data.get('comprimento')
+        elif tipo_apelido == '3letras':
+            kwargs['sigla'] = data.get('sigla')
+            kwargs['diametro'] = data.get('diametro')
+            kwargs['comprimento'] = data.get('comprimento')
+        elif tipo_apelido == 'descritivo':
+            kwargs['descricao'] = data.get('descricao')
+            kwargs['diametro'] = data.get('diametro')
+            kwargs['comprimento'] = data.get('comprimento')
+        
+        codigo_apelido, descricao = sistema_pecas.adicionar_apelido(
+            codigo_guardian, tipo_apelido, **kwargs
+        )
+        
+        log_acao("adicionar_apelido", codigo_guardian, f"apelido={codigo_apelido}")
+        
+        return jsonify({
+            "sucesso": True,
+            "codigo_apelido": codigo_apelido,
+            "descricao": descricao
+        })
+    except Exception as e:
+        logger.error(f"Erro ao adicionar apelido: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/fornecedores/cadastrar", methods=["POST"])
+@login_required
+def api_cadastrar_fornecedor():
+    try:
+        data = request.json
+        codigo_fornecedor = data.get('codigo_fornecedor')
+        nome = data.get('nome')
+        contato = data.get('contato')
+        email = data.get('email')
+        telefone = data.get('telefone')
+        endereco = data.get('endereco')
+        
+        sistema_pecas.cadastrar_fornecedor(
+            codigo_fornecedor=codigo_fornecedor,
+            nome=nome,
+            contato=contato,
+            email=email,
+            telefone=telefone,
+            endereco=endereco
+        )
+        
+        log_acao("cadastrar_fornecedor", codigo_fornecedor, f"nome={nome}")
+        
+        return jsonify({
+            "sucesso": True,
+            "mensagem": "Fornecedor cadastrado com sucesso"
+        })
+    except Exception as e:
+        logger.error(f"Erro ao cadastrar fornecedor: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/pecas/associar_fornecedor", methods=["POST"])
+@login_required
+def api_associar_fornecedor_peca():
+    try:
+        data = request.json
+        codigo_guardian = data.get('codigo_guardian')
+        codigo_fornecedor = data.get('codigo_fornecedor')
+        codigo_forn_peca = data.get('codigo_forn_peca')
+        preco = data.get('preco')
+        prazo = data.get('prazo')
+        
+        sistema_pecas.associar_fornecedor_peca(
+            codigo_guardian=codigo_guardian,
+            codigo_fornecedor=codigo_fornecedor,
+            codigo_forn_peca=codigo_forn_peca,
+            preco=preco,
+            prazo=prazo
+        )
+        
+        log_acao("associar_fornecedor_peca", codigo_guardian, 
+                 f"fornecedor={codigo_fornecedor}, codigo_forn_peca={codigo_forn_peca}")
+        
+        return jsonify({
+            "sucesso": True,
+            "mensagem": "Fornecedor associado com sucesso"
+        })
+    except Exception as e:
+        logger.error(f"Erro ao associar fornecedor: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/pecas/buscar", methods=["GET"])
+@login_required
+def api_buscar_peca():
+    try:
+        tipo_busca = request.args.get('tipo')
+        codigo = request.args.get('codigo')
+        codigo_fornecedor = request.args.get('codigo_fornecedor')
+        
+        if tipo_busca == 'guardian':
+            resultado = sistema_pecas.buscar_por_guardian(codigo)
+        elif tipo_busca == 'apelido':
+            resultado = sistema_pecas.buscar_por_apelido(codigo)
+        elif tipo_busca == 'fornecedor':
+            resultado = sistema_pecas.buscar_por_fornecedor(codigo_fornecedor, codigo)
+        else:
+            return jsonify({"erro": "Tipo de busca inválido"}), 400
+        
+        if resultado:
+            return jsonify({
+                "sucesso": True,
+                "peca": resultado
+            })
+        else:
+            return jsonify({"sucesso": False, "mensagem": "Peça não encontrada"})
+    except Exception as e:
+        logger.error(f"Erro ao buscar peça: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/pecas/pesquisar", methods=["GET"])
+@login_required
+def api_pesquisar_pecas():
+    try:
+        termo = request.args.get('termo')
+        categoria = request.args.get('categoria')
+        material = request.args.get('material')
+        data_inicio = request.args.get('data_inicio')
+        data_fim = request.args.get('data_fim')
+        
+        filtros = {}
+        if categoria:
+            filtros['categoria'] = categoria
+        if material:
+            filtros['material'] = material
+        if data_inicio:
+            filtros['data_inicio'] = data_inicio
+        if data_fim:
+            filtros['data_fim'] = data_fim
+        
+        resultados = sistema_pecas.pesquisar_pecas(termo=termo, filtros=filtros)
+        
+        return jsonify({
+            "sucesso": True,
+            "resultados": resultados,
+            "total": len(resultados)
+        })
+    except Exception as e:
+        logger.error(f"Erro ao pesquisar peças: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/pecas/informacoes_completas/<codigo_guardian>", methods=["GET"])
+@login_required
+def api_informacoes_completas_peca(codigo_guardian):
+    try:
+        info = sistema_pecas.obter_informacoes_completas(codigo_guardian)
+        
+        if info:
+            return jsonify({
+                "sucesso": True,
+                "informacoes": info
+            })
+        else:
+            return jsonify({"sucesso": False, "mensagem": "Peça não encontrada"})
+    except Exception as e:
+        logger.error(f"Erro ao obter informações completas da peça: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/pecas/listar", methods=["GET"])
+@login_required
+def api_listar_pecas():
+    try:
+        pecas = sistema_pecas.listar_todas_pecas()
+        
+        return jsonify({
+            "sucesso": True,
+            "pecas": pecas,
+            "total": len(pecas)
+        })
+    except Exception as e:
+        logger.error(f"Erro ao listar peças: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/fornecedores/listar", methods=["GET"])
+@login_required
+def api_listar_fornecedores():
+    try:
+        fornecedores = sistema_pecas.listar_fornecedores()
+        
+        return jsonify({
+            "sucesso": True,
+            "fornecedores": fornecedores,
+            "total": len(fornecedores)
+        })
+    except Exception as e:
+        logger.error(f"Erro ao listar fornecedores: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/pecas/excluir/<codigo_guardian>", methods=["DELETE"])
+@login_required
+def api_excluir_peca(codigo_guardian):
+    try:
+        sistema_pecas.excluir_peca(codigo_guardian)
+        
+        log_acao("excluir_peca", codigo_guardian)
+        
+        return jsonify({
+            "sucesso": True,
+            "mensagem": "Peça excluída com sucesso"
+        })
+    except Exception as e:
+        logger.error(f"Erro ao excluir peça: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+# ---------------------------
+# API: CAD
+# ---------------------------
+@app.route("/api/cad/cadastrar", methods=["POST"])
+@login_required
+def api_cadastrar_cad():
+    try:
+        data = request.json
+        codigo_fornecedor = data.get('codigo_fornecedor')
+        numero_cad = data.get('numero_cad')
+        data_emissao = data.get('data_emissao')
+        data_validade = data.get('data_validade')
+        escopo = data.get('escopo')
+        observacoes = data.get('observacoes')
+        
+        id_certificado, certificado = sistema_pecas.cadastrar_certificado_cad(
+            codigo_fornecedor=codigo_fornecedor,
+            numero_cad=numero_cad,
+            data_emissao=data_emissao,
+            data_validade=data_validade,
+            escopo=escopo,
+            observacoes=observacoes
+        )
+        
+        log_acao("cadastrar_cad", numero_cad, f"fornecedor={codigo_fornecedor}")
+        
+        return jsonify({
+            "sucesso": True,
+            "id_certificado": id_certificado,
+            "certificado": asdict(certificado)
+        })
+    except Exception as e:
+        logger.error(f"Erro ao cadastrar CAD: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/cad/adicionar_documento", methods=["POST"])
+@login_required
+def api_adicionar_documento_cad():
+    try:
+        data = request.json
+        id_certificado = data.get('id_certificado')
+        tipo_documento = data.get('tipo_documento')
+        nome_arquivo = data.get('nome_arquivo')
+        caminho_arquivo = data.get('caminho_arquivo')
+        observacoes = data.get('observacoes')
+        
+        id_documento, documento = sistema_pecas.adicionar_documento_cad(
+            id_certificado=id_certificado,
+            tipo_documento=tipo_documento,
+            nome_arquivo=nome_arquivo,
+            caminho_arquivo=caminho_arquivo,
+            observacoes=observacoes
+        )
+        
+        log_acao("adicionar_documento_cad", str(id_certificado), f"documento={nome_arquivo}")
+        
+        return jsonify({
+            "sucesso": True,
+            "id_documento": id_documento,
+            "documento": asdict(documento)
+        })
+    except Exception as e:
+        logger.error(f"Erro ao adicionar documento CAD: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/cad/atualizar_status", methods=["POST"])
+@login_required
+def api_atualizar_status_cad():
+    try:
+        data = request.json
+        id_certificado = data.get('id_certificado')
+        novo_status = data.get('novo_status')
+        
+        sistema_pecas.atualizar_status_cad(id_certificado, novo_status)
+        
+        log_acao("atualizar_status_cad", str(id_certificado), f"novo_status={novo_status}")
+        
+        return jsonify({
+            "sucesso": True,
+            "mensagem": "Status atualizado com sucesso"
+        })
+    except Exception as e:
+        logger.error(f"Erro ao atualizar status CAD: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/cad/verificar_validade", methods=["GET"])
+@login_required
+def api_verificar_validade_cads():
+    try:
+        vencidos = sistema_pecas.verificar_validade_cads()
+        
+        return jsonify({
+            "sucesso": True,
+            "vencidos": vencidos,
+            "mensagem": f"{vencidos} CADs foram marcados como vencidos"
+        })
+    except Exception as e:
+        logger.error(f"Erro ao verificar validade CADs: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/cad/fornecedor/<codigo_fornecedor>", methods=["GET"])
+@login_required
+def api_cads_fornecedor(codigo_fornecedor):
+    try:
+        cads = sistema_pecas.obter_cads_fornecedor(codigo_fornecedor)
+        
+        return jsonify({
+            "sucesso": True,
+            "certificados": [asdict(cad) for cad in cads],
+            "total": len(cads)
+        })
+    except Exception as e:
+        logger.error(f"Erro ao obter CADs do fornecedor: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/cad/buscar", methods=["GET"])
+@login_required
+def api_buscar_cad():
+    try:
+        numero_cad = request.args.get('numero_cad')
+        
+        certificado = sistema_pecas.obter_cad_por_numero(numero_cad)
+        
+        if certificado:
+            return jsonify({
+                "sucesso": True,
+                "certificado": asdict(certificado)
+            })
+        else:
+            return jsonify({"sucesso": False, "mensagem": "CAD não encontrado"})
+    except Exception as e:
+        logger.error(f"Erro ao buscar CAD: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/cad/vencendo", methods=["GET"])
+@login_required
+def api_cads_vencendo():
+    try:
+        dias = request.args.get('dias', 30, type=int)
+        
+        cads_vencendo = sistema_pecas.listar_cads_vencendo(dias)
+        
+        return jsonify({
+            "sucesso": True,
+            "cads_vencendo": cads_vencendo,
+            "total": len(cads_vencendo)
+        })
+    except Exception as e:
+        logger.error(f"Erro ao listar CADs vencendo: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/cad/relatorio", methods=["GET"])
+@login_required
+def api_relatorio_cad():
+    try:
+        relatorio = sistema_pecas.gerar_relatorio_cad()
+        
+        return jsonify({
+            "sucesso": True,
+            "relatorio": relatorio
+        })
+    except Exception as e:
+        logger.error(f"Erro ao gerar relatório CAD: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+# ---------------------------
+# API: filtros (iguais ao v3.0)
+# ---------------------------
+@app.route("/api/categorias")
+def api_categorias():
+    try:
+        con = db_mysql()
+        with con.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT codigo_maquina AS sigla, categoria
+                FROM keystone
+                ORDER BY categoria
+            """
+            )
+            rows = cur.fetchall()
+        con.close()
+        return jsonify(rows)
+    except Exception as e:
+        logger.error(f"Erro ao carregar categorias: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/modelos")
+def api_modelos():
+    try:
+        sigla = request.args.get("sigla","").strip()
+        con = db_mysql()
+        with con.cursor() as cur:
+            if sigla:
+                cur.execute("""
+                    SELECT DISTINCT modelo, descricao
+                    FROM keystone
+                    WHERE codigo_maquina=%s
+                    ORDER BY modelo
+                """, (sigla,))
+            else:
+                cur.execute("""
+                    SELECT DISTINCT modelo, descricao
+                    FROM keystone
+                    ORDER BY modelo
+                """
+                )
+            rows = cur.fetchall()
+        con.close()
+        return jsonify(rows)
+    except Exception as e:
+        logger.error(f"Erro ao carregar modelos: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/ramos")
+def api_ramos():
+    try:
+        sigla = request.args.get("sigla","").strip()
+        modelo= request.args.get("modelo","").strip()
+        con = db_mysql()
+        with con.cursor() as cur:
+            if sigla and modelo:
+                cur.execute("""
+                    SELECT DISTINCT tipo AS tipo
+                    FROM keystone
+                    WHERE codigo_maquina=%s AND modelo=%s
+                    ORDER BY tipo
+                """, (sigla,modelo))
+            elif sigla:
+                cur.execute("""
+                    SELECT DISTINCT tipo AS tipo
+                    FROM keystone
+                    WHERE codigo_maquina=%s
+                    ORDER BY tipo
+                """, (sigla,))
+            else:
+                cur.execute("""SELECT DISTINCT tipo AS tipo FROM keystone ORDER BY tipo"""
+                )
+            rows = cur.fetchall()
+        con.close()
+        return jsonify(rows)
+    except Exception as e:
+        logger.error(f"Erro ao carregar ramos: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/conjuntos")
+def api_conjuntos():
+    try:
+        con = db_mysql()
+        with con.cursor() as cur:
+            cur.execute("""
+                SELECT sigla, COALESCE(nome, descricao) AS nome, descricao
+                FROM conjuntos
+                ORDER BY nome
+            """
+            )
+            rows = cur.fetchall()
+        con.close()
+        return jsonify(rows)
+    except Exception as e:
+        logger.error(f"Erro ao carregar conjuntos: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/auxiliares")
+def api_aux():
+    try:
+        conj = request.args.get("conjunto","").strip()
+        con = db_mysql()
+        with con.cursor() as cur:
+            if conj:
+                cur.execute("""
+                    SELECT sigla_conjunto, sigla_auxiliar, nome
+                    FROM conjuntos_auxiliar
+                    WHERE sigla_conjunto=%s
+                    ORDER BY nome
+                """, (conj,))
+            else:
+                cur.execute("""
+                    SELECT sigla_conjunto, sigla_auxiliar, nome
+                    FROM conjuntos_auxiliar
+                    ORDER BY nome
+                """
+                )
+            rows = cur.fetchall()
+        con.close()
+        return jsonify(rows)
+    except Exception as e:
+        logger.error(f"Erro ao carregar auxiliares: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+@app.route("/api/pecas")
+def api_pecas():
+    try:
+        con = db_mysql()
+        with con.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT sigla, nome
+                FROM pecas
+                ORDER BY nome
+            """
+            )
+            rows = cur.fetchall()
+        con.close()
+        return jsonify(rows)
+    except Exception as e:
+        logger.error(f"Erro ao carregar peças: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+# ---------------------------
+# API: Prévia (adaptável)
+# ---------------------------
+@app.route("/api/preview")
+def api_preview():
+    try:
+        d = request.args
+        sig_eq = d.get("categoria_sigla","")
+        modelo = d.get("modelo","")
+        ramo   = d.get("ramo","")
+        id_eq  = d.get("id_eq","01")
+        cj_sig = d.get("conjunto_sigla","")
+        aux_sig= d.get("auxiliar_sigla","")
+        id_cj  = d.get("id_cj","01")
+        p_sig  = d.get("peca_sigla","")
+        origem = d.get("origem","F")
+        familia= d.get("familia","F")
+        id_p   = d.get("id_peca","001")
+
+        # Buscar nome da categoria
+        cat_nome = ""
+        if sig_eq:
+            con = db_mysql()
+            with con.cursor() as cur:
+                cur.execute("SELECT categoria FROM keystone WHERE codigo_maquina=%s LIMIT 1", (sig_eq,))
+                r = cur.fetchone()
+                cat_nome = (r["categoria"] if r else "") or sig_eq
+            con.close()
+
+        ref = build_reference(sig_eq, modelo, ramo, id_eq, cj_sig, aux_sig, id_cj, p_sig, origem, familia, id_p)
+
+        # Criar estrutura de pastas
+        local_path = ensure_dirs_by_name(cat_nome, sig_eq, modelo, ramo, id_eq)
+        share_path = to_share(local_path)
+        
+        # Verificar recursos disponíveis
+        features = check_available_features()
+        
+        # Valores padrão para informações de controle
+        dono_eq = versao_eq = momento_eq = ""
+        dono_cj = versao_cj = momento_cj = ""
+        dono_pc = versao_pc = momento_pc = ""
+        
+        # Buscar informações de controle apenas se as colunas existirem
+        if features['has_novas_colunas']:
+            try:
+                con = db_mysql()
+                with con.cursor() as cur:
+                    # Equipamento
+                    cur.execute("""
+                        SELECT dono_atual, versao_atual, momento_atual 
+                        FROM keystone 
+                        WHERE codigo_maquina=%s AND modelo=%s AND tipo=%s
+                    """, (sig_eq, modelo, ramo))
+                    eq_info = cur.fetchone()
+                    if eq_info:
+                        dono_eq = eq_info.get("dono_atual", "") or ""
+                        versao_eq = eq_info.get("versao_atual", 1) or 1
+                        momento_eq = eq_info.get("momento_atual", "S") or "S"
+                    
+                    # Conjunto
+                    cur.execute("""
+                        SELECT dono_atual, versao_atual, momento_atual 
+                        FROM conjuntos 
+                        WHERE sigla=%s
+                    """, (cj_sig,))
+                    cj_info = cur.fetchone()
+                    if cj_info:
+                        dono_cj = cj_info.get("dono_atual", "") or ""
+                        versao_cj = cj_info.get("versao_atual", 1) or 1
+                        momento_cj = cj_info.get("momento_atual", "S") or "S"
+                    
+                    # Peça
+                    cur.execute("""
+                        SELECT dono_atual, versao_atual, momento_atual 
+                        FROM pecas 
+                        WHERE sigla=%s
+                    """, (p_sig,))
+                    pc_info = cur.fetchone()
+                    if pc_info:
+                        dono_pc = pc_info.get("dono_atual", "") or ""
+                        versao_pc = pc_info.get("versao_atual", 1) or 1
+                        momento_pc = pc_info.get("momento_atual", "S") or "S"
+                        
+                con.close()
+            except Exception as e:
+                logger.error(f"Erro ao buscar informações de controle: {e}")
+
+        return jsonify({
+            "referencia": ref,
+            "equipamento": f"{norm2(sig_eq)}{norm2(modelo)}{norm1(ramo)}{z2(id_eq)}",
+            "conjunto": f"{norm2(cj_sig)}{norm1(aux_sig)}{z2(id_cj)}",
+            "peca": f"{norm3(p_sig)}{norm1(origem)}{norm1(familia)}{z3(id_p)}",
+            "link_local": local_path,
+            "link_rede": share_path,
+            "dono_equipamento": dono_eq,
+            "versao_equipamento": versao_eq,
+            "momento_equipamento": momento_eq,
+            "dono_conjunto": dono_cj,
+            "versao_conjunto": versao_cj,
+            "momento_conjunto": momento_cj,
+            "dono_peca": dono_pc,
+            "versao_peca": versao_pc,
+            "momento_peca": momento_pc
+        })
+    except Exception as e:
+        logger.error(f"Erro na prévia: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+# ---------------------------
+# API: Pesquisar (CORRIGIDO para usar a estrutura real da tabela)
+# ---------------------------
+@app.route("/api/pesquisar")
+def api_pesquisar():
+    try:
+        q = (request.args.get("q") or "").strip()
+        sig_eq = request.args.get("categoria_sigla","").strip()
+        modelo = request.args.get("modelo","").strip()
+        ramo   = request.args.get("ramo","").strip()
+        id_eq  = request.args.get("id_eq","").strip()
+        cj_sig = request.args.get("conjunto_sigla","").strip()
+        aux_sig= request.args.get("auxiliar_sigla","").strip()
+        id_cj  = request.args.get("id_cj","").strip()
+        p_sig  = request.args.get("peca_sigla","").strip()
+        origem = request.args.get("origem","").strip()
+        familia= request.args.get("familia","").strip()
+        id_p   = request.args.get("id_peca","").strip()
+        desc   = (request.args.get("descricao") or "").strip()
+
+        con = db_mysql()
+        cur = con.cursor()
+        
+        # Montar a referência parcial para busca
+        ref_parcial = ""
+        if sig_eq: ref_parcial += norm2(sig_eq)
+        if modelo: ref_parcial += norm2(modelo)
+        if ramo: ref_parcial += norm1(ramo)
+        if id_eq: ref_parcial += z2(id_eq)
+        if cj_sig: ref_parcial += norm2(cj_sig)
+        if aux_sig: ref_parcial += norm1(aux_sig)
+        if id_cj: ref_parcial += z2(id_cj)
+        if p_sig: ref_parcial += norm3(p_sig)
+        if origem: ref_parcial += norm1(origem)
+        if familia: ref_parcial += norm1(familia)
+        if id_p: ref_parcial += z3(id_p)
+
+        # Construir a query baseada na estrutura real da tabela
+        sql = """
+            SELECT referencia, descricao, link_pasta, status_referencia
+            FROM steeltabel WHERE 1=1
+        """
+        
+        params = []
+        
+        # Se houver texto livre, buscar na referência ou descrição
+        if q:
+            sql += " AND (referencia LIKE %s OR descricao LIKE %s)"
+            params.extend([f"%{q}%", f"%{q}%"])
+        else:
+            # Se não houver texto livre, usar os filtros
+            if ref_parcial:
+                sql += " AND referencia LIKE %s"
+                params.append(f"{ref_parcial}%")
+            if desc:
+                sql += " AND descricao LIKE %s"
+                params.append(f"%{desc}%")
+        
+        # Ordenar por referência
+        sql += " ORDER BY referencia"
+        
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        con.close()
+        
+        return jsonify(rows)
+    except Exception as e:
+        logger.error(f"Erro na pesquisa: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+# ---------------------------
+# API: Cadastrar
+# ---------------------------
+@app.route("/api/cadastrar", methods=["POST"])
+@login_required
+def api_cadastrar():
+    try:
+        d = request.json
+        sig_eq = d.get("categoria_sigla","")
+        modelo = d.get("modelo","")
+        ramo   = d.get("ramo","")
+        id_eq  = d.get("id_eq","01")
+        cj_sig = d.get("conjunto_sigla","")
+        aux_sig= d.get("auxiliar_sigla","")
+        id_cj  = d.get("id_cj","01")
+        p_sig  = d.get("peca_sigla","")
+        origem = d.get("origem","F")
+        familia= d.get("familia","F")
+        id_p   = d.get("id_peca","001")
+        desc   = d.get("descricao","DESCRIÇÃO NÃO INFORMADA")
+
+        # Buscar nome da categoria
+        cat_nome = ""
+        if sig_eq:
+            con = db_mysql()
+            with con.cursor() as cur:
+                cur.execute("SELECT categoria FROM keystone WHERE codigo_maquina=%s LIMIT 1", (sig_eq,))
+                r = cur.fetchone()
+                cat_nome = (r["categoria"] if r else "") or sig_eq
+            con.close()
+
+        ref = build_reference(sig_eq, modelo, ramo, id_eq, cj_sig, aux_sig, id_cj, p_sig, origem, familia, id_p)
+
+        # Criar estrutura de pastas
+        local_path = ensure_dirs_by_name(cat_nome, sig_eq, modelo, ramo, id_eq)
+        share_path = to_share(local_path)
+
+        # Verificar se já existe
+        con = db_mysql()
+        with con.cursor() as cur:
+            cur.execute("SELECT 1 FROM steeltabel WHERE referencia=%s LIMIT 1", (ref,))
+            if cur.fetchone():
+                con.close()
+                return jsonify({"duplicado": True, "referencia": ref})
+
+            # Inserir
+            cur.execute("""
+                INSERT INTO steeltabel 
+                (referencia, descricao, link_pasta, data_criacao, usuario_criacao)
+                VALUES (%s, %s, %s, NOW(), %s)
+            """, (ref, desc, local_path, session.get("user","")))
+            con.commit()
+        con.close()
+
+        log_acao("cadastrar", ref, f"descricao={desc}")
+
+        return jsonify({
+            "duplicado": False,
+            "referencia": ref,
+            "link_local": local_path,
+            "link_rede": share_path
+        })
+    except Exception as e:
+        logger.error(f"Erro ao cadastrar: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+# ---------------------------
+# API: Abrir Pasta
+# ---------------------------
+@app.route("/api/abrir_pasta", methods=["POST"])
+@login_required
+def api_abrir_pasta():
+    try:
+        data = request.json
+        referencia = data.get("referencia")
+        
+        # Buscar o caminho da pasta no banco de dados
+        con = db_mysql()
+        with con.cursor() as cur:
+            cur.execute("SELECT link_pasta FROM steeltabel WHERE referencia = %s", (referencia,))
+            result = cur.fetchone()
+        con.close()
+        
+        if not result:
+            return jsonify({"success": False, "erro": "Referência não encontrada"}), 404
+        
+        pasta_path = result["link_pasta"]
+        
+        # Abrir a pasta no explorador de arquivos
+        success = open_folder_in_explorer(pasta_path)
+        
+        if success:
+            log_acao("abrir_pasta", referencia)
+            return jsonify({"success": True})
+        else:
+            return jsonify({"success": False, "erro": "Não foi possível abrir a pasta"}), 500
+            
+    except Exception as e:
+        logger.error(f"Erro ao abrir pasta: {e}")
+        return jsonify({"success": False, "erro": str(e)}), 500
+
+# ---------------------------
+# API: Alterar Fase
+# ---------------------------
+@app.route("/api/alterar_fase", methods=["POST"])
+@login_required
+def api_alterar_fase():
+    try:
+        data = request.json
+        referencia = data.get("referencia")
+        fase = data.get("fase")
+        campo = data.get("campo")
+        valor = data.get("valor")
+        motivo = data.get("motivo")
+        
+        # Verificar se as colunas existem
+        features = check_available_features()
+        if not features['has_novas_colunas']:
+            return jsonify({"sucesso": False, "erro": "Funcionalidade não disponível"}), 400
+        
+        # Determinar a tabela com base na fase
+        if fase == "equipamento":
+            tabela = "keystone"
+            # Extrair partes da referência para identificar o equipamento
+            sigla_eq = referencia[:2]
+            modelo = referencia[2:4]
+            ramo = referencia[4:5]
+            id_eq = referencia[5:7]
+            
+            where_clause = "codigo_maquina=%s AND modelo=%s AND tipo=%s"
+            where_params = [sigla_eq, modelo, ramo]
+            
+        elif fase == "conjunto":
+            tabela = "conjuntos"
+            # Extrair partes da referência para identificar o conjunto
+            sigla_cj = referencia[7:9]
+            
+            where_clause = "sigla=%s"
+            where_params = [sigla_cj]
+            
+        elif fase == "peca":
+            tabela = "pecas"
+            # Extrair partes da referência para identificar a peça
+            sigla_peca = referencia[10:13]
+            
+            where_clause = "sigla=%s"
+            where_params = [sigla_peca]
+            
+        else:
+            return jsonify({"sucesso": False, "erro": "Fase inválida"}), 400
+        
+        # Buscar valor atual
+        con = db_mysql()
+        with con.cursor() as cur:
+            cur.execute(f"SELECT {campo} FROM {tabela} WHERE {where_clause}", where_params)
+            result = cur.fetchone()
+            
+            if not result:
+                con.close()
+                return jsonify({"sucesso": False, "erro": "Registro não encontrado"}), 404
+            
+            valor_antigo = result.get(campo, "")
+            
+            # Se for versão e o valor for "INCREMENTAR", incrementar
+            if campo == "versao_atual" and valor == "INCREMENTAR":
+                novo_valor = int(valor_antigo or 1) + 1
+            else:
+                novo_valor = valor
+            
+            # Atualizar
+            cur.execute(f"UPDATE {tabela} SET {campo}=%s WHERE {where_clause}", [novo_valor] + where_params)
+            con.commit()
+        con.close()
+        
+        # Registrar histórico
+        registrar_historico(
+            referencia=referencia,
+            fase=fase,
+            acao=f"alterar_{campo}",
+            valor_antigo=str(valor_antigo),
+            valor_novo=str(novo_valor),
+            usuario=session.get("user", ""),
+            motivo=motivo
+        )
+        
+        log_acao(f"alterar_{campo}", referencia, f"fase={fase}, valor_antigo={valor_antigo}, valor_novo={novo_valor}")
+        
+        return jsonify({"sucesso": True})
+        
+    except Exception as e:
+        logger.error(f"Erro ao alterar fase: {e}")
+        return jsonify({"sucesso": False, "erro": str(e)}), 500
+
+# ---------------------------
+# API: Decompor Referência
+# ---------------------------
+@app.route("/api/decompor_referencia")
+def api_decompor_referencia():
+    try:
+        ref = request.args.get("ref", "").strip()
+        
+        if len(ref) != 20:
+            return jsonify({"erro": "Referência deve ter 20 caracteres"}), 400
+        
+        # Extrair partes da referência
+        sigla_eq = ref[0:2]
+        modelo = ref[2:4]
+        ramo = ref[4:5]
+        id_eq = ref[5:7]
+        sigla_cj = ref[7:9]
+        sigla_aux = ref[9:10]
+        id_cj = ref[10:12]
+        sigla_peca = ref[12:15]
+        origem = ref[15:16]
+        familia = ref[16:17]
+        id_peca = ref[17:20]
+        
+        # Buscar nomes no banco de dados
+        nomes = {
+            "equipamento": "",
+            "conjunto": "",
+            "auxiliar": "",
+            "peca": ""
+        }
+        
+        con = db_mysql()
+        with con.cursor() as cur:
+            # Buscar nome do equipamento
+            cur.execute("""
+                SELECT categoria FROM keystone 
+                WHERE codigo_maquina=%s AND modelo=%s AND tipo=%s
+                LIMIT 1
+            """, (sigla_eq, modelo, ramo))
+            eq_result = cur.fetchone()
+            if eq_result:
+                nomes["equipamento"] = eq_result["categoria"]
+            
+            # Buscar nome do conjunto
+            cur.execute("""
+                SELECT COALESCE(nome, descricao) AS nome FROM conjuntos 
+                WHERE sigla=%s
+                LIMIT 1
+            """, (sigla_cj,))
+            cj_result = cur.fetchone()
+            if cj_result:
+                nomes["conjunto"] = cj_result["nome"]
+            
+            # Buscar nome do auxiliar
+            cur.execute("""
+                SELECT nome FROM conjuntos_auxiliar 
+                WHERE sigla_conjunto=%s AND sigla_auxiliar=%s
+                LIMIT 1
+            """, (sigla_cj, sigla_aux))
+            aux_result = cur.fetchone()
+            if aux_result:
+                nomes["auxiliar"] = aux_result["nome"]
+            
+            # Buscar nome da peça
+            cur.execute("""
+                SELECT nome FROM pecas 
+                WHERE sigla=%s
+                LIMIT 1
+            """, (sigla_peca,))
+            peca_result = cur.fetchone()
+            if peca_result:
+                nomes["peca"] = peca_result["nome"]
+        con.close()
+        
+        decomposicao = {
+            "equipamento_sigla": sigla_eq,
+            "equipamento_modelo": modelo,
+            "equipamento_ramo": ramo,
+            "equipamento_id": id_eq,
+            "conjunto_sigla": sigla_cj,
+            "conjunto_auxiliar": sigla_aux,
+            "conjunto_id": id_cj,
+            "peca_sigla": sigla_peca,
+            "peca_origem": origem,
+            "peca_familia": familia,
+            "peca_id": id_peca
+        }
+        
+        return jsonify({
+            "referencia": ref,
+            "decomposicao": decomposicao,
+            "nomes": nomes
+        })
+        
+    except Exception as e:
+        logger.error(f"Erro ao decompor referência: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+# ---------------------------
+# API: Pesquisa Avançada
+# ---------------------------
+@app.route("/api/pesquisar_avancada", methods=["POST"])
+def api_pesquisar_avancada():
+    try:
+        data = request.json
+        termo = data.get("termo", "").strip()
+        tipo = data.get("tipo", "todas")
+        
+        if not termo:
+            return jsonify({"erro": "Termo de pesquisa não informado"}), 400
+        
+        con = db_mysql()
+        cur = con.cursor()
+        
+        # Construir a query baseada no tipo de pesquisa
+        if tipo == "todas":
+            sql = """
+                SELECT referencia, descricao, link_pasta, status_referencia
+                FROM steeltabel
+                WHERE referencia LIKE %s OR descricao LIKE %s
+                ORDER BY referencia
+            """
+            params = [f"%{termo}%", f"%{termo}%"]
+        elif tipo == "equipamento":
+            sql = """
+                SELECT referencia, descricao, link_pasta, status_referencia
+                FROM steeltabel
+                WHERE SUBSTRING(referencia, 1, 7) LIKE %s
+                ORDER BY referencia
+            """
+            params = [f"{termo}%"]
+        elif tipo == "conjunto":
+            sql = """
+                SELECT referencia, descricao, link_pasta, status_referencia
+                FROM steeltabel
+                WHERE SUBSTRING(referencia, 8, 5) LIKE %s
+                ORDER BY referencia
+            """
+            params = [f"{termo}%"]
+        elif tipo == "peca":
+            sql = """
+                SELECT referencia, descricao, link_pasta, status_referencia
+                FROM steeltabel
+                WHERE SUBSTRING(referencia, 13, 8) LIKE %s
+                ORDER BY referencia
+            """
+            params = [f"{termo}%"]
+        else:
+            con.close()
+            return jsonify({"erro": "Tipo de pesquisa inválido"}), 400
+        
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        con.close()
+        
+        return jsonify(rows)
+        
+    except Exception as e:
+        logger.error(f"Erro na pesquisa avançada: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+# ---------------------------
+# HTML (com detecção de recursos e sistema de peças)
+# ---------------------------
+APP_HTML = r"""<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<title>Guardian Web {{versao}}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<link rel="stylesheet"
+ href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
+
+<style>
+body { background:#f7fafc; color:#1a202c; }
+.card { background:#ffffff; border:1px solid #e2e8f0; }
+.form-select, .form-control { background:#ffffff; color:#1a202c; border-color:#cbd5e0; }
+.form-select:focus, .form-control:focus { border-color:#3182ce; box-shadow:none; }
+.btn-primary { background:#2563eb; border:0; }
+.badge-ghost { background:#edf2f7; border:1px solid #e2e8f0; color:#2b6cb0; }
+.small-hint { color:#4a5568; font-size:0.85rem; }
+table.table td, table.table th { color:#1a202c; }
+a, a:hover { color:#2b6cb0; }
+.required { color:#c53030; }
+.folder-icon { color: #eab308; cursor: pointer; font-size: 1.2rem; }
+.folder-icon:hover { color: #ca8a04; }
+.dono-info { font-size: 0.8rem; color: #64748b; margin-top: 0.25rem; }
+.momento-info { font-size: 0.8rem; color: #64748b; margin-top: 0.25rem; }
+.status-badge { font-size: 0.75rem; }
+.recurso-indicator { 
+    position: fixed; 
+    bottom: 20px; 
+    right: 20px; 
+    padding: 10px; 
+    background: #f0f0f0; 
+    border-radius: 5px; 
+    font-size: 0.8rem;
+    z-index: 1000;
+}
+/* Correção para tabela expandida */
+.table-responsive {
+    overflow-y: visible !important;
+    overflow-x: hidden !important;
+}
+.table {
+    width: 100% !important;
+    table-layout: fixed;
+}
+.table th, .table td {
+    white-space: normal;
+    word-wrap: break-word;
+    vertical-align: middle;
+}
+/* Abas */
+.nav-tabs .nav-link {
+    color: #4a5568;
+}
+.nav-tabs .nav-link.active {
+    color: #2563eb;
+    font-weight: 500;
+}
+.tab-content {
+    margin-top: 1rem;
+}
+/* Sistema de Peças */
+.pecas-section {
+    display: none;
+}
+.pecas-section.active {
+    display: block;
+}
+.pecas-card {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 0.5rem;
+    padding: 1rem;
+    margin-bottom: 1rem;
+}
+.pecas-card h5 {
+    color: #2d3748;
+    margin-bottom: 0.75rem;
+}
+.pecas-form .form-label {
+    font-weight: 500;
+    color: #4a5568;
+}
+.pecas-form .form-control, .pecas-form .form-select {
+    margin-bottom: 0.5rem;
+}
+.pecas-result {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 0.375rem;
+    padding: 0.75rem;
+    margin-top: 0.5rem;
+}
+.pecas-result h6 {
+    color: #2d3748;
+    margin-bottom: 0.5rem;
+}
+.pecas-result p {
+    margin-bottom: 0.25rem;
+    color: #4a5568;
+}
+.pecas-result .badge {
+    margin-right: 0.25rem;
+}
+</style>
+</head>
+<body>
+<div class="container py-4">
+
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h2 class="m-0">Guardian Web <span class="badge badge-ghost">v{{versao}}</span></h2>
+    <div>
+      <span class="me-2">Logado como: <strong id="userLabel">{{user}}</strong> (<span id="roleLabel">{{role}}</span>)</span>
+      <a class="btn btn-sm btn-outline-secondary" href="/logout">Sair</a>
+    </div>
+  </div>
+
+  <!-- Abas de Navegação -->
+  <ul class="nav nav-tabs" id="mainTabs" role="tablist">
+    <li class="nav-item" role="presentation">
+      <button class="nav-link active" id="guardian-tab" data-bs-toggle="tab" data-bs-target="#guardian" type="button" role="tab" aria-controls="guardian" aria-selected="true">Guardian Web</button>
+    </li>
+    <li class="nav-item" role="presentation">
+      <button class="nav-link" id="pecas-tab" data-bs-toggle="tab" data-bs-target="#pecas" type="button" role="tab" aria-controls="pecas" aria-selected="false">Sistema de Peças</button>
+    </li>
+    <li class="nav-item" role="presentation">
+      <button class="nav-link" id="cad-tab" data-bs-toggle="tab" data-bs-target="#cad" type="button" role="tab" aria-controls="cad" aria-selected="false">CAD Único</button>
+    </li>
+  </ul>
+
+  <div class="tab-content" id="mainTabsContent">
+    <!-- Aba Guardian Web -->
+    <div class="tab-pane fade show active" id="guardian" role="tabpanel" aria-labelledby="guardian-tab">
+      <div class="row g-3">
+        <div class="col-12 col-lg-8">
+          <div class="card p-3">
+            <div class="d-flex flex-wrap gap-2 mb-2">
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="modo" id="modo_pesq" value="pesquisar" checked>
+                <label class="form-check-label" for="modo_pesq">Pesquisar</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="modo" id="modo_cad" value="cadastrar">
+                <label class="form-check-label" for="modo_cad">Cadastrar</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="modo" id="modo_mix" value="mix">
+                <label class="form-check-label" for="modo_mix">Pesq + Cad</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="modo" id="modo_reg" value="registrar">
+                <label class="form-check-label" for="modo_reg">Registrar Base (Admin/Lafaiete)</label>
+              </div>
+            </div>
+
+            <div class="row g-3">
+              <!-- Coluna Máquina -->
+              <div class="col-12 col-md-4">
+                <div class="card p-3">
+                  <h5 class="mb-3">Máquina</h5>
+                  <label class="form-label">Categoria (nome)</label>
+                  <select id="categoria" class="form-select"></select>
+
+                  <label class="form-label mt-2">Modelo</label>
+                  <select id="modelo" class="form-select"></select>
+
+                  <label class="form-label mt-2">Ramo (P/B/O/R)</label>
+                  <select id="ramo" class="form-select"></select>
+
+                  <label class="form-label mt-2">ID Máquina</label>
+                  <input id="id_eq" class="form-control" value="01">
+                </div>
+              </div>
+
+              <!-- Coluna Conjunto -->
+              <div class="col-12 col-md-4">
+                <div class="card p-3">
+                  <h5 class="mb-3">Conjunto</h5>
+                  <label class="form-label">Conjunto (nome — sigla — descrição)</label>
+                  <select id="conjunto" class="form-select"></select>
+
+                  <label class="form-label mt-2">Auxiliar (nome — sigla)</label>
+                  <select id="auxiliar" class="form-select"></select>
+
+                  <label class="form-label mt-2">ID Conjunto</label>
+                  <input id="id_cj" class="form-control" value="01">
+                </div>
+              </div>
+
+              <!-- Coluna Peça -->
+              <div class="col-12 col-md-4">
+                <div class="card p-3">
+                  <h5 class="mb-3">Peça</h5>
+                  <label class="form-label">Peça (nome — sigla)</label>
+                  <select id="peca" class="form-select"></select>
+
+                  <div class="row g-2 mt-0">
+                    <div class="col-4">
+                      <label class="form-label mt-2">Origem</label>
+                      <select id="origem" class="form-select">
+                        <option value="">(vazio)</option>
+                        <option value="F" selected>F</option>
+                        <option value="C">C</option>
+                        <option value="N">N</option>
+                      </select>
+                    </div>
+                    <div class="col-4">
+                      <label class="form-label mt-2">Família</label>
+                      <select id="familia" class="form-select">
+                        <option value="">(vazio)</option>
+                        <option value="F" selected>F</option>
+                        <option value="U">U</option>
+                        <option value="L">L</option>
+                        <option value="O">O</option>
+                      </select>
+                    </div>
+                    <div class="col-4">
+                      <label class="form-label mt-2">ID Peça</label>
+                      <input id="id_peca" class="form-control" value="001">
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Descrição -->
+            <div class="card p-3 mt-3">
+              <label class="form-label">Descrição</label>
+              <textarea id="descricao" class="form-control" rows="2">DESCRIÇÃO NÃO INFORMADA</textarea>
+              <div class="small-hint mt-2">Dica: deixe filtros vazios para listar "todos" na pesquisa.</div>
+            </div>
+
+            <!-- Ações -->
+            <div class="d-flex flex-wrap gap-2 mt-3">
+              <button id="btnPreview" class="btn btn-secondary">Prévia</button>
+              <button id="btnPesquisar" class="btn btn-outline-primary">Pesquisar</button>
+              <button id="btnPesquisarAvancada" class="btn btn-outline-info">Pesquisa Avançada</button>
+              <button id="btnDecompor" class="btn btn-outline-secondary">Decompor Referência</button>
+              <button id="btnCadastrar" class="btn btn-primary">Cadastrar</button>
+              <button id="btnRegistrar" class="btn btn-warning">Registrar Base</button>
+            </div>
+
+          </div>
+        </div>
+
+        <div class="col-12 col-lg-4">
+          <!-- Prévia -->
+          <div class="card p-3 mb-3">
+            <h5 class="mb-2">Prévia</h5>
+            <div class="mb-1"><strong>Referência:</strong> <span id="refPrev"></span></div>
+            <div class="mb-1">
+              <strong>Equipamento:</strong> <span id="eqPrev"></span>
+              <div id="eqInfo" style="display: none;">
+                <div class="dono-info">Dono: <span id="donoEqPrev"></span> | Versão: <span id="versaoEqPrev"></span></div>
+                <div class="momento-info">Momento: <span id="momentoEqPrev"></span></div>
+              </div>
+            </div>
+            <div class="mb-1">
+              <strong>Conjunto:</strong> <span id="cjPrev"></span>
+              <div id="cjInfo" style="display: none;">
+                <div class="dono-info">Dono: <span id="donoCjPrev"></span> | Versão: <span id="versaoCjPrev"></span></div>
+                <div class="momento-info">Momento: <span id="momentoCjPrev"></span></div>
+              </div>
+            </div>
+            <div class="mb-1">
+              <strong>Peça:</strong> <span id="pcPrev"></span>
+              <div id="pcInfo" style="display: none;">
+                <div class="dono-info">Dono: <span id="donoPcPrev"></span> | Versão: <span id="versaoPcPrev"></span></div>
+                <div class="momento-info">Momento: <span id="momentoPcPrev"></span></div>
+              </div>
+            </div>
+            <div class="mb-1"><strong>Pasta local:</strong> <span id="localPrev"></span></div>
+            <div class="mb-1"><strong>Pasta rede:</strong> <span id="redePrev"></span></div>
+          </div>
+
+          <!-- Resultados -->
+          <div class="card p-3">
+            <h5 class="mb-2">Resultados</h5>
+            <div class="table-responsive">
+              <table class="table table-sm table-striped">
+                <thead>
+                  <tr>
+                    <th>Referência</th>
+                    <th>Descrição</th>
+                    <th>Status</th>
+                    <th>Abrir Pasta</th>
+                    <th id="acoesHeader" style="display: none;">Ações</th>
+                  </tr>
+                </thead>
+                <tbody id="grid"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Aba Sistema de Peças -->
+    <div class="tab-pane fade" id="pecas" role="tabpanel" aria-labelledby="pecas-tab">
+      <div class="row g-3">
+        <div class="col-12 col-lg-8">
+          <!-- Abas do Sistema de Peças -->
+          <ul class="nav nav-tabs" id="pecasTabs" role="tablist">
+            <li class="nav-item" role="presentation">
+              <button class="nav-link active" id="criar-pecas-tab" data-bs-toggle="tab" data-bs-target="#criar-pecas" type="button" role="tab" aria-controls="criar-pecas" aria-selected="true">Criar Peças</button>
+            </li>
+            <li class="nav-item" role="presentation">
+              <button class="nav-link" id="buscar-pecas-tab" data-bs-toggle="tab" data-bs-target="#buscar-pecas" type="button" role="tab" aria-controls="buscar-pecas" aria-selected="false">Buscar Peças</button>
+            </li>
+            <li class="nav-item" role="presentation">
+              <button class="nav-link" id="fornecedores-tab" data-bs-toggle="tab" data-bs-target="#fornecedores" type="button" role="tab" aria-controls="fornecedores" aria-selected="false">Fornecedores</button>
+            </li>
+          </ul>
+
+          <div class="tab-content" id="pecasTabsContent">
+            <!-- Criar Peças -->
+            <div class="tab-pane fade show active" id="criar-pecas" role="tabpanel" aria-labelledby="criar-pecas-tab">
+              <div class="pecas-card">
+                <h5>Criar Código Guardian</h5>
+                <div class="pecas-form">
+                  <div class="row g-2">
+                    <div class="col-md-6">
+                      <label class="form-label">Nome da Peça</label>
+                      <input type="text" class="form-control" id="pecaNome" placeholder="Nome completo da peça">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Categoria</label>
+                      <input type="text" class="form-control" id="pecaCategoria" placeholder="Categoria da peça">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Material</label>
+                      <input type="text" class="form-control" id="pecaMaterial" placeholder="Material da peça">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Peso (kg)</label>
+                      <input type="number" class="form-control" id="pecaPeso" placeholder="Peso em kg" step="0.01">
+                    </div>
+                    <div class="col-12">
+                      <label class="form-label">Observações</label>
+                      <textarea class="form-control" id="pecaObservacoes" rows="2" placeholder="Observações sobre a peça"></textarea>
+                    </div>
+                    <div class="col-12">
+                      <button class="btn btn-primary" id="btnCriarPeca">Criar Código Guardian</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="resultadoCriarPeca" class="pecas-result" style="display: none;"></div>
+              </div>
+
+              <div class="pecas-card">
+                <h5>Adicionar Apelido</h5>
+                <div class="pecas-form">
+                  <div class="row g-2">
+                    <div class="col-md-6">
+                      <label class="form-label">Código Guardian</label>
+                      <input type="text" class="form-control" id="apelidoGuardian" placeholder="Código Guardian existente">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Tipo de Apelido</label>
+                      <select class="form-select" id="apelidoTipo">
+                        <option value="norma">Norma (ex: DIN 912)</option>
+                        <option value="3letras">3 Letras (ex: PAR)</option>
+                        <option value="descritivo">Descritivo</option>
+                      </select>
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">Diâmetro (mm)</label>
+                      <input type="number" class="form-control" id="apelidoDiametro" placeholder="Diâmetro">
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">Comprimento (mm)</label>
+                      <input type="number" class="form-control" id="apelidoComprimento" placeholder="Comprimento">
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">Norma/Sigla/Descrição</label>
+                      <input type="text" class="form-control" id="apelidoNorma" placeholder="Depende do tipo">
+                    </div>
+                    <div class="col-12">
+                      <button class="btn btn-primary" id="btnAdicionarApelido">Adicionar Apelido</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="resultadoAdicionarApelido" class="pecas-result" style="display: none;"></div>
+              </div>
+
+              <div class="pecas-card">
+                <h5>Associar Fornecedor</h5>
+                <div class="pecas-form">
+                  <div class="row g-2">
+                    <div class="col-md-6">
+                      <label class="form-label">Código Guardian</label>
+                      <input type="text" class="form-control" id="fornecedorGuardian" placeholder="Código Guardian existente">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Código do Fornecedor</label>
+                      <input type="text" class="form-control" id="fornecedorCodigo" placeholder="Código do fornecedor">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Código da Peça no Fornecedor</label>
+                      <input type="text" class="form-control" id="fornecedorPeca" placeholder="Código da peça no fornecedor">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Preço</label>
+                      <input type="number" class="form-control" id="fornecedorPreco" placeholder="Preço" step="0.01">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Prazo</label>
+                      <input type="text" class="form-control" id="fornecedorPrazo" placeholder="Prazo de entrega">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Nome do Fornecedor</label>
+                      <input type="text" class="form-control" id="fornecedorNome" placeholder="Nome do fornecedor (se novo)">
+                    </div>
+                    <div class="col-12">
+                      <button class="btn btn-primary" id="btnAssociarFornecedor">Associar Fornecedor</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="resultadoAssociarFornecedor" class="pecas-result" style="display: none;"></div>
+              </div>
+            </div>
+
+            <!-- Buscar Peças -->
+            <div class="tab-pane fade" id="buscar-pecas" role="tabpanel" aria-labelledby="buscar-pecas-tab">
+              <div class="pecas-card">
+                <h5>Pesquisar Peças</h5>
+                <div class="pecas-form">
+                  <div class="row g-2">
+                    <div class="col-md-8">
+                      <label class="form-label">Termo de Pesquisa</label>
+                      <input type="text" class="form-control" id="pesquisaTermo" placeholder="Digite o termo para pesquisa">
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">Categoria</label>
+                      <select class="form-select" id="pesquisaCategoria">
+                        <option value="">Todas</option>
+                      </select>
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">Material</label>
+                      <select class="form-select" id="pesquisaMaterial">
+                        <option value="">Todos</option>
+                      </select>
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">Data Início</label>
+                      <input type="date" class="form-control" id="pesquisaDataInicio">
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">Data Fim</label>
+                      <input type="date" class="form-control" id="pesquisaDataFim">
+                    </div>
+                    <div class="col-12">
+                      <button class="btn btn-primary" id="btnPesquisarPecas">Pesquisar</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="resultadoPesquisarPecas" class="pecas-result" style="display: none;"></div>
+              </div>
+
+              <div class="pecas-card">
+                <h5>Buscar por Código</h5>
+                <div class="pecas-form">
+                  <div class="row g-2">
+                    <div class="col-md-4">
+                      <label class="form-label">Tipo de Busca</label>
+                      <select class="form-select" id="buscaTipo">
+                        <option value="guardian">Código Guardian</option>
+                        <option value="apelido">Código Apelido</option>
+                        <option value="fornecedor">Código Fornecedor</option>
+                      </select>
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">Código</label>
+                      <input type="text" class="form-control" id="buscaCodigo" placeholder="Digite o código">
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">Código Fornecedor (se aplicável)</label>
+                      <input type="text" class="form-control" id="buscaFornecedor" placeholder="Código do fornecedor">
+                    </div>
+                    <div class="col-12">
+                      <button class="btn btn-primary" id="btnBuscarPorCodigo">Buscar</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="resultadoBuscarPorCodigo" class="pecas-result" style="display: none;"></div>
+              </div>
+            </div>
+
+            <!-- Fornecedores -->
+            <div class="tab-pane fade" id="fornecedores" role="tabpanel" aria-labelledby="fornecedores-tab">
+              <div class="pecas-card">
+                <h5>Cadastrar Fornecedor</h5>
+                <div class="pecas-form">
+                  <div class="row g-2">
+                    <div class="col-md-6">
+                      <label class="form-label">Código do Fornecedor</label>
+                      <input type="text" class="form-control" id="novoFornecedorCodigo" placeholder="Código único">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Nome do Fornecedor</label>
+                      <input type="text" class="form-control" id="novoFornecedorNome" placeholder="Nome completo">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Contato</label>
+                      <input type="text" class="form-control" id="novoFornecedorContato" placeholder="Nome do contato">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Email</label>
+                      <input type="email" class="form-control" id="novoFornecedorEmail" placeholder="Email do contato">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Telefone</label>
+                      <input type="text" class="form-control" id="novoFornecedorTelefone" placeholder="Telefone">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Endereço</label>
+                      <input type="text" class="form-control" id="novoFornecedorEndereco" placeholder="Endereço completo">
+                    </div>
+                    <div class="col-12">
+                      <button class="btn btn-primary" id="btnCadastrarFornecedor">Cadastrar Fornecedor</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="resultadoCadastrarFornecedor" class="pecas-result" style="display: none;"></div>
+              </div>
+
+              <div class="pecas-card">
+                <h5>Listar Fornecedores</h5>
+                <div class="pecas-form">
+                  <div class="row g-2">
+                    <div class="col-12">
+                      <button class="btn btn-primary" id="btnListarFornecedores">Listar Todos</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="resultadoListarFornecedores" class="pecas-result" style="display: none;"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12 col-lg-4">
+          <!-- Informações do Sistema de Peças -->
+          <div class="card p-3 mb-3">
+            <h5 class="mb-2">Informações do Sistema</h5>
+            <div class="mb-1"><strong>Total de Peças:</strong> <span id="totalPecas">-</span></div>
+            <div class="mb-1"><strong>Total de Fornecedores:</strong> <span id="totalFornecedores">-</span></div>
+            <div class="mb-1"><strong>Total de Apelidos:</strong> <span id="totalApelidos">-</span></div>
+            <div class="mb-1"><strong>Total de Associações:</strong> <span id="totalAssociacoes">-</span></div>
+          </div>
+
+          <!-- Resultados Detalhados -->
+          <div class="card p-3">
+            <h5 class="mb-2">Detalhes da Peça</h5>
+            <div id="detalhesPeca">
+              <p class="text-muted">Selecione uma peça para ver detalhes</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Aba CAD Único -->
+    <div class="tab-pane fade" id="cad" role="tabpanel" aria-labelledby="cad-tab">
+      <div class="row g-3">
+        <div class="col-12 col-lg-8">
+          <!-- Abas do CAD -->
+          <ul class="nav nav-tabs" id="cadTabs" role="tablist">
+            <li class="nav-item" role="presentation">
+              <button class="nav-link active" id="cadastrar-cad-tab" data-bs-toggle="tab" data-bs-target="#cadastrar-cad" type="button" role="tab" aria-controls="cadastrar-cad" aria-selected="true">Cadastrar CAD</button>
+            </li>
+            <li class="nav-item" role="presentation">
+              <button class="nav-link" id="gerenciar-cad-tab" data-bs-toggle="tab" data-bs-target="#gerenciar-cad" type="button" role="tab" aria-controls="gerenciar-cad" aria-selected="false">Gerenciar CADs</button>
+            </li>
+            <li class="nav-item" role="presentation">
+              <button class="nav-link" id="relatorio-cad-tab" data-bs-toggle="tab" data-bs-target="#relatorio-cad" type="button" role="tab" aria-controls="relatorio-cad" aria-selected="false">Relatórios</button>
+            </li>
+          </ul>
+
+          <div class="tab-content" id="cadTabsContent">
+            <!-- Cadastrar CAD -->
+            <div class="tab-pane fade show active" id="cadastrar-cad" role="tabpanel" aria-labelledby="cadastrar-cad-tab">
+              <div class="pecas-card">
+                <h5>Cadastrar Novo CAD</h5>
+                <div class="pecas-form">
+                  <div class="row g-2">
+                    <div class="col-md-6">
+                      <label class="form-label">Fornecedor</label>
+                      <select class="form-select" id="cadFornecedor">
+                        <option value="">Selecione um fornecedor</option>
+                      </select>
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Número do CAD</label>
+                      <input type="text" class="form-control" id="cadNumero" placeholder="Número único do CAD">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Data de Emissão</label>
+                      <input type="date" class="form-control" id="cadEmissao">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Data de Validade</label>
+                      <input type="date" class="form-control" id="cadValidade">
+                    </div>
+                    <div class="col-12">
+                      <label class="form-label">Escopo</label>
+                      <textarea class="form-control" id="cadEscopo" rows="2" placeholder="Descrição do escopo do CAD"></textarea>
+                    </div>
+                    <div class="col-12">
+                      <label class="form-label">Observações</label>
+                      <textarea class="form-control" id="cadObservacoes" rows="2" placeholder="Observações sobre o CAD"></textarea>
+                    </div>
+                    <div class="col-12">
+                      <button class="btn btn-primary" id="btnCadastrarCAD">Cadastrar CAD</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="resultadoCadastrarCAD" class="pecas-result" style="display: none;"></div>
+              </div>
+
+              <div class="pecas-card">
+                <h5>Adicionar Documento ao CAD</h5>
+                <div class="pecas-form">
+                  <div class="row g-2">
+                    <div class="col-md-6">
+                      <label class="form-label">CAD</label>
+                      <select class="form-select" id="docCAD">
+                        <option value="">Selecione um CAD</option>
+                      </select>
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Tipo de Documento</label>
+                      <select class="form-select" id="docTipo">
+                        <option value="CERTIFICADO_QUALIDADE">Certificado de Qualidade</option>
+                        <option value="LICENCA_OPERACAO">Licença de Operação</option>
+                        <option value="CERTIFICADO_BOMBAS">Certificado de Bombas</option>
+                        <option value="RELATORIO_TECNICO">Relatório Técnico</option>
+                        <option value="OUTRO">Outro</option>
+                      </select>
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Nome do Arquivo</label>
+                      <input type="text" class="form-control" id="docNome" placeholder="Nome do arquivo">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Caminho do Arquivo</label>
+                      <input type="text" class="form-control" id="docCaminho" placeholder="Caminho completo do arquivo">
+                    </div>
+                    <div class="col-12">
+                      <label class="form-label">Observações</label>
+                      <textarea class="form-control" id="docObservacoes" rows="2" placeholder="Observações sobre o documento"></textarea>
+                    </div>
+                    <div class="col-12">
+                      <button class="btn btn-primary" id="btnAdicionarDocumento">Adicionar Documento</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="resultadoAdicionarDocumento" class="pecas-result" style="display: none;"></div>
+              </div>
+            </div>
+
+            <!-- Gerenciar CADs -->
+            <div class="tab-pane fade" id="gerenciar-cad" role="tabpanel" aria-labelledby="gerenciar-cad-tab">
+              <div class="pecas-card">
+                <h5>Gerenciar CADs</h5>
+                <div class="pecas-form">
+                  <div class="row g-2">
+                    <div class="col-md-6">
+                      <label class="form-label">Fornecedor</label>
+                      <select class="form-select" id="gerenciarFornecedor">
+                        <option value="">Todos os fornecedores</option>
+                      </select>
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Status</label>
+                      <select class="form-select" id="gerenciarStatus">
+                        <option value="">Todos os status</option>
+                        <option value="Pendente">Pendente</option>
+                        <option value="Em Análise">Em Análise</option>
+                        <option value="Aprovado">Aprovado</option>
+                        <option value="Reprovado">Reprovado</option>
+                        <option value="Vencido">Vencido</option>
+                      </select>
+                    </div>
+                    <div class="col-12">
+                      <button class="btn btn-primary" id="btnListarCADs">Listar CADs</button>
+                      <button class="btn btn-warning ms-2" id="btnVerificarValidade">Verificar Validade</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="resultadoListarCADs" class="pecas-result" style="display: none;"></div>
+              </div>
+
+              <div class="pecas-card">
+                <h5>Atualizar Status do CAD</h5>
+                <div class="pecas-form">
+                  <div class="row g-2">
+                    <div class="col-md-6">
+                      <label class="form-label">CAD</label>
+                      <select class="form-select" id="atualizarCAD">
+                        <option value="">Selecione um CAD</option>
+                      </select>
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label">Novo Status</label>
+                      <select class="form-select" id="novoStatus">
+                        <option value="Pendente">Pendente</option>
+                        <option value="Em Análise">Em Análise</option>
+                        <option value="Aprovado">Aprovado</option>
+                        <option value="Reprovado">Reprovado</option>
+                        <option value="Vencido">Vencido</option>
+                      </select>
+                    </div>
+                    <div class="col-12">
+                      <button class="btn btn-primary" id="btnAtualizarStatus">Atualizar Status</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="resultadoAtualizarStatus" class="pecas-result" style="display: none;"></div>
+              </div>
+            </div>
+
+            <!-- Relatórios -->
+            <div class="tab-pane fade" id="relatorio-cad" role="tabpanel" aria-labelledby="relatorio-cad-tab">
+              <div class="pecas-card">
+                <h5>Relatórios de CAD</h5>
+                <div class="pecas-form">
+                  <div class="row g-2">
+                    <div class="col-12">
+                      <button class="btn btn-primary" id="btnGerarRelatorio">Gerar Relatório Geral</button>
+                      <button class="btn btn-info ms-2" id="btnListarVencendo">Listar CADs Vencendo</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="resultadoRelatorioCAD" class="pecas-result" style="display: none;"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12 col-lg-4">
+          <!-- Informações do CAD -->
+          <div class="card p-3 mb-3">
+            <h5 class="mb-2">Informações do CAD</h5>
+            <div class="mb-1"><strong>Total de CADs:</strong> <span id="totalCADs">-</span></div>
+            <div class="mb-1"><strong>CADs Aprovados:</strong> <span id="cadsAprovados">-</span></div>
+            <div class="mb-1"><strong>CADs Vencidos:</strong> <span id="cadsVencidos">-</span></div>
+            <div class="mb-1"><strong>CADs Vencendo (30 dias):</strong> <span id="cadsVencendo">-</span></div>
+          </div>
+
+          <!-- Detalhes do CAD -->
+          <div class="card p-3">
+            <h5 class="mb-2">Detalhes do CAD</h5>
+            <div id="detalhesCAD">
+              <p class="text-muted">Selecione um CAD para ver detalhes</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Indicador de Recursos -->
+  <div class="recurso-indicator" id="recursoIndicator">
+    <strong>Modo:</strong> <span id="modoSistema">Carregando...</span>
+  </div>
+
+</div>
+
+<script>
+const VERSION = "{{ versao }}";
+const USER = "{{ user }}";
+const ROLE = "{{ role }}";
+const HAS_NOVAS_COLUNAS = {{ "true" if has_novas_colunas else "false" }} === true;
+</script>
+
+{% raw %}
+<script>
+// Funções utilitárias
+function loadSelect($sel, arr, labelCb, valueKey){
+  $sel.empty();
+  $sel.append(new Option("(todos)", ""));
+  (arr||[]).forEach(o=>{
+    const label = labelCb(o);
+    const val = o[valueKey] || "";
+    $sel.append(new Option(label, val));
+  });
+}
+
+async function apiGet(path, params){
+  const url = new URL(path, window.location.origin);
+  if(params){ Object.keys(params).forEach(k=> url.searchParams.append(k, params[k])); }
+  const r = await fetch(url, {credentials:"include"});
+  if(!r.ok){ throw new Error(await r.text()); }
+  return r.json();
+}
+
+async function apiPost(path, payload){
+  const r = await fetch(path, {
+    method:"POST",
+    headers: { "Content-Type":"application/json" },
+    credentials:"include",
+    body: JSON.stringify(payload||{})
+  });
+  if(!r.ok){ throw new Error(await r.text()); }
+  return r.json();
+}
+
+// Funções do Guardian Web
+async function initCombos(){
+  const cats = await apiGet("/api/categorias");
+  loadSelect($("#categoria"), cats, o=> (o.categoria||""), "sigla");
+
+  const cjs  = await apiGet("/api/conjuntos");
+  loadSelect($("#conjunto"), cjs, o=>{
+    const nome = o.nome||"";
+    const sig  = o.sigla||"";
+    const desc = o.descricao||"";
+    return `${nome} — ${sig}${desc?(" — "+desc):""}`;
+  }, "sigla");
+
+  const pecs = await apiGet("/api/pecas");
+  loadSelect($("#peca"), pecs, o=> `${o.nome||""} — ${o.sigla||""}`, "sigla");
+
+  $("#modelo").empty().append(new Option("(todos)",""));
+  $("#ramo").empty().append(new Option("(todos)",""));
+  $("#auxiliar").empty().append(new Option("(todos)",""));
+}
+
+async function loadModelos(){
+  const sigla = $("#categoria").val() || "";
+  const arr = await apiGet("/api/modelos", { sigla });
+  const $m = $("#modelo");
+  $m.empty(); $m.append(new Option("(todos)",""));
+  (arr||[]).forEach(o=>{
+    const label = (o.descricao||"") + (o.modelo?(" — "+o.modelo):"");
+    $m.append(new Option(label, o.modelo||""));
+  });
+  $("#ramo").empty().append(new Option("(todos)",""));
+}
+
+async function loadRamos(){
+  const sigla = $("#categoria").val() || "";
+  const modelo= $("#modelo").val() || "";
+  const arr = await apiGet("/api/ramos", { sigla, modelo });
+  const $r = $("#ramo");
+  $r.empty(); $r.append(new Option("(todos)",""));
+  (arr||[]).forEach(o=> $r.append(new Option(o.tipo||"", o.tipo||"")));
+}
+
+async function loadAuxiliares(){
+  const conjunto = $("#conjunto").val() || "";
+  const arr = await apiGet("/api/auxiliares", { conjunto });
+  const $a = $("#auxiliar");
+  $a.empty(); $a.append(new Option("(todos)",""));
+  (arr||[]).forEach(o=>{
+    const label = (o.nome||"") + (o.sigla_auxiliar?(" — "+o.sigla_auxiliar):"");
+    $a.append(new Option(label, o.sigla_auxiliar||""));
+  });
+}
+
+function collect(){
+  return {
+    categoria_sigla: $("#categoria").val(),
+    modelo: $("#modelo").val(),
+    ramo: $("#ramo").val(),
+    id_eq: $("#id_eq").val(),
+    conjunto_sigla: $("#conjunto").val(),
+    auxiliar_sigla: $("#auxiliar").val(),
+    id_cj: $("#id_cj").val(),
+    peca_sigla: $("#peca").val(),
+    origem: $("#origem").val(),
+    familia: $("#familia").val(),
+    id_peca: $("#id_peca").val(),
+    descricao: $("#descricao").val()
+  };
+}
+
+async function preview(){
+  try{
+    const p = collect();
+    const j = await apiGet("/api/preview", p);
+    $("#refPrev").text(j.referencia||"");
+    $("#eqPrev").text(j.equipamento||"");
+    $("#cjPrev").text(j.conjunto||"");
+    $("#pcPrev").text(j.peca||"");
+    $("#localPrev").text(j.link_local||"");
+    $("#redePrev").text(j.link_rede||"");
+    
+    // Mostrar informações de controle apenas se existirem
+    if (HAS_NOVAS_COLUNAS) {
+      $("#eqInfo").show();
+      $("#cjInfo").show();
+      $("#pcInfo").show();
+      $("#acoesHeader").show();
+      
+      $("#donoEqPrev").text(j.dono_equipamento||"");
+      $("#versaoEqPrev").text(j.versao_equipamento||"1");
+      $("#momentoEqPrev").text(j.momento_equipamento||"");
+      
+      $("#donoCjPrev").text(j.dono_conjunto||"");
+      $("#versaoCjPrev").text(j.versao_conjunto||"1");
+      $("#momentoCjPrev").text(j.momento_conjunto||"");
+      
+      $("#donoPcPrev").text(j.dono_peca||"");
+      $("#versaoPcPrev").text(j.versao_peca||"1");
+      $("#momentoPcPrev").text(j.momento_peca||"");
+    } else {
+      $("#eqInfo").hide();
+      $("#cjInfo").hide();
+      $("#pcInfo").hide();
+      $("#acoesHeader").hide();
+    }
+    
+  }catch(e){ alert("Prévia falhou: " + e); }
+}
+
+async function pesquisar(){
+  const p = collect();
+  let q = prompt(`Pesquisa livre:\n\n- Digite parte da referência\n- Ou texto livre para buscar na descrição\n- Ou deixe em branco para usar os filtros atuais`, "");
+  
+  if(q !== null){ 
+    p.q = q; 
+  }
+  
+  try{
+    const j = await apiGet("/api/pesquisar", p);
+    const $g = $("#grid"); 
+    $g.empty();
+    
+    if(j.length === 0){
+      $g.append('<tr><td colspan="5" class="text-center">Nenhum resultado encontrado</td></tr>');
+      return;
+    }
+    
+    j.forEach(r=>{
+      const tr = $("<tr/>");
+      tr.append($("<td/>").text(r.referencia||""));
+      tr.append($("<td/>").text(r.descricao||""));
+      
+      // Status badge
+      let statusClass = "bg-secondary";
+      let statusText = r.status_referencia || "novo";
+      
+      if (statusText === "EmEdição") statusClass = "bg-warning";
+      else if (statusText === "Sincronizada") statusClass = "bg-success";
+      else if (statusText === "Obsoleta") statusClass = "bg-danger";
+      else if (statusText === "Montagem") statusClass = "bg-primary";
+      
+      const statusBadge = $(`<span class="badge status-badge ${statusClass}">${statusText}</span>`);
+      tr.append($("<td/>").html(statusBadge));
+      
+      // Ícone para abrir pasta
+      const folderIcon = $("<i/>")
+        .addClass("bi bi-folder folder-icon")
+        .attr("title", "Abrir pasta")
+        .on("click", function() {
+          abrirPasta(r.referencia);
+        });
+      tr.append($("<td/>").append(folderIcon));
+      
+      // Botões de ação (apenas se tiver novas colunas)
+      const acoes = $("<td/>");
+      if (HAS_NOVAS_COLUNAS) {
+        // Botão para alterar dono
+        const btnDono = $(`<button class="btn btn-sm btn-outline-primary btn-action me-1" title="Alterar Dono"><i class="bi bi-person"></i></button>`)
+          .on("click", function() {
+            alterarFase(r.referencia, "equipamento", "dono");
+          });
+        
+        // Botão para incrementar versão
+        const btnVersao = $(`<button class="btn btn-sm btn-outline-secondary btn-action me-1" title="Nova Versão"><i class="bi bi-arrow-repeat"></i></button>`)
+          .on("click", function() {
+            alterarFase(r.referencia, "equipamento", "versao");
+          });
+        
+        // Botão para alterar momento
+        const btnMomento = $(`<button class="btn btn-sm btn-outline-warning btn-action" title="Alterar Momento"><i class="bi bi-clock-history"></i></button>`)
+          .on("click", function() {
+            alterarFase(r.referencia, "equipamento", "momento");
+          });
+        
+        acoes.append(btnDono);
+        acoes.append(btnVersao);
+        acoes.append(btnMomento);
+      }
+      tr.append(acoes);
+      
+      $g.append(tr);
+    });
+    
+    alert(`Encontrados ${j.length} resultado(s)`);
+    
+  }catch(e){ 
+    alert("Pesquisa falhou: " + e); 
+  }
+}
+
+async function abrirPasta(referencia){
+  try{
+    console.log("Tentando abrir pasta para referência:", referencia);
+    const response = await apiPost("/api/abrir_pasta", { referencia: referencia });
+    
+    if(response.success){
+      console.log("Pasta aberta com sucesso");
+      // Não mostrar alerta, apenas abrir a pasta
+    } else {
+      console.error("Erro ao abrir pasta:", response.erro);
+      alert("Erro ao abrir pasta: " + response.erro);
+    }
+  }catch(e){
+    console.error("Exceção ao abrir pasta:", e);
+    alert("Erro ao abrir pasta: " + e);
+  }
+}
+
+async function alterarFase(referencia, fase, campo){
+  let novoValor;
+  let motivo;
+
+  if (campo === "versao") {
+    // Para versão, não pedimos o valor - será incrementado automaticamente
+    motivo = prompt("Motivo da alteração:");
+    if (!motivo) return;
+    novoValor = "INCREMENTAR"; // Indicador para o backend
+  } else {
+    novoValor = prompt(`Novo valor para ${campo}:`);
+    if (!novoValor) return;
+    motivo = prompt("Motivo da alteração:");
+    if (!motivo) return;
+  }
+
+  try {
+    const response = await apiPost("/api/alterar_fase", {
+      referencia: referencia,
+      fase: fase,
+      campo: campo,
+      valor: novoValor,
+      motivo: motivo
+    });
+
+    if (response.sucesso) {
+      alert(`${campo} atualizado com sucesso!`);
+      preview(); // Atualizar prévia
+    } else {
+      alert(`Erro: ${response.erro}`);
+    }
+  } catch (e) {
+    alert(`Falha ao atualizar: ${e}`);
+  }
+}
+
+async function pesquisarAvancada(){
+  const termo = prompt("Digite a referência ou parte dela:", "");
+  if(termo === null) return;
+  
+  const tipo = prompt("Tipo de pesquisa:\n\ntodas - Em toda referência\nequipamento - Apenas equipamento\nconjunto - Apenas conjunto\npeca - Apenas peça", "todas");
+  
+  if(tipo === null) return;
+  
+  try{
+    const response = await apiPost("/api/pesquisar_avancada", {
+      termo: termo,
+      tipo: tipo
+    });
+    
+    const $g = $("#grid"); 
+    $g.empty();
+    
+    if(response.length === 0){
+      $g.append('<tr><td colspan="5" class="text-center">Nenhum resultado encontrado</td></tr>');
+      return;
+    }
+    
+    response.forEach(r=>{
+      const tr = $("<tr/>");
+      tr.append($("<td/>").text(r.referencia||""));
+      tr.append($("<td/>").text(r.descricao||""));
+      
+      // Status badge
+      let statusClass = "bg-secondary";
+      let statusText = r.status_referencia || "novo";
+      
+      if (statusText === "EmEdição") statusClass = "bg-warning";
+      else if (statusText === "Sincronizada") statusClass = "bg-success";
+      else if (statusText === "Obsoleta") statusClass = "bg-danger";
+      else if (statusText === "Montagem") statusClass = "bg-primary";
+      
+      const statusBadge = $(`<span class="badge status-badge ${statusClass}">${statusText}</span>`);
+      tr.append($("<td/>").html(statusBadge));
+      
+      // Ícone para abrir pasta
+      const folderIcon = $("<i/>")
+        .addClass("bi bi-folder folder-icon")
+        .attr("title", "Abrir pasta")
+        .on("click", function() {
+          abrirPasta(r.referencia);
+        });
+      tr.append($("<td/>").append(folderIcon));
+      
+      // Botões de ação (apenas se tiver novas colunas)
+      const acoes = $("<td/>");
+      if (HAS_NOVAS_COLUNAS) {
+        // Botão para alterar dono
+        const btnDono = $(`<button class="btn btn-sm btn-outline-primary btn-action me-1" title="Alterar Dono"><i class="bi bi-person"></i></button>`)
+          .on("click", function() {
+            alterarFase(r.referencia, "equipamento", "dono");
+          });
+        
+        // Botão para incrementar versão
+        const btnVersao = $(`<button class="btn btn-sm btn-outline-secondary btn-action me-1" title="Nova Versão"><i class="bi bi-arrow-repeat"></i></button>`)
+          .on("click", function() {
+            alterarFase(r.referencia, "equipamento", "versao");
+          });
+        
+        // Botão para alterar momento
+        const btnMomento = $(`<button class="btn btn-sm btn-outline-warning btn-action" title="Alterar Momento"><i class="bi bi-clock-history"></i></button>`)
+          .on("click", function() {
+            alterarFase(r.referencia, "equipamento", "momento");
+          });
+        
+        acoes.append(btnDono);
+        acoes.append(btnVersao);
+        acoes.append(btnMomento);
+      }
+      tr.append(acoes);
+      
+      $g.append(tr);
+    });
+    
+    alert(`Encontrados ${response.length} resultado(s)`);
+    
+  }catch(e){ 
+    alert("Pesquisa avançada falhou: " + e); 
+  }
+}
+
+async function decomporReferencia(){
+  const ref = prompt("Cole a referência completa (20 caracteres) para decompor:", "");
+  if(!ref) return;
+  
+  try{
+    const response = await apiGet("/api/decompor_referencia", {ref: ref});
+    
+    let mensagem = `REFERÊNCIA: ${response.referencia}\n\n`;
+    mensagem += `EQUIPAMENTO:\n`;
+    mensagem += `- Sigla: ${response.decomposicao.equipamento_sigla} (${response.nomes.equipamento})\n`;
+    mensagem += `- Modelo: ${response.decomposicao.equipamento_modelo}\n`;
+    mensagem += `- Ramo: ${response.decomposicao.equipamento_ramo}\n`;
+    mensagem += `- ID: ${response.decomposicao.equipamento_id}\n\n`;
+    
+    mensagem += `CONJUNTO:\n`;
+    mensagem += `- Sigla: ${response.decomposicao.conjunto_sigla} (${response.nomes.conjunto})\n`;
+    mensagem += `- Auxiliar: ${response.decomposicao.conjunto_auxiliar} (${response.nomes.auxiliar})\n`;
+    mensagem += `- ID: ${response.decomposicao.conjunto_id}\n\n`;
+    
+    mensagem += `PEÇA:\n`;
+    mensagem += `- Sigla: ${response.decomposicao.peca_sigla} (${response.nomes.peca})\n`;
+    mensagem += `- Origem: ${response.decomposicao.peca_origem}\n`;
+    mensagem += `- Família: ${response.decomposicao.peca_familia}\n`;
+    mensagem += `- ID: ${response.decomposicao.peca_id}`;
+    
+    alert(mensagem);
+    
+  }catch(e){
+    alert("Erro ao decompor referência: " + e);
+  }
+}
+
+async function cadastrar(){
+  try{
+    const p = collect();
+    const j = await apiPost("/api/cadastrar", p);
+    if(j.duplicado){
+      const escolha = confirm("Referência já existe.\n\nAbrir pasta existente?");
+      if(escolha){ 
+        await abrirPasta(j.referencia);
+      }
+      return;
+    }
+    
+    alert("Cadastrado com sucesso.\nRef: " + (j.referencia||"") + "\nPasta: " + (j.link_local||""));
+    $("#refPrev").text(j.referencia||"");
+    $("#localPrev").text(j.link_local||"");
+    $("#redePrev").text(j.link_rede||"");
+    
+    // Mostrar informações de controle apenas se existirem
+    if (HAS_NOVAS_COLUNAS) {
+      $("#eqInfo").show();
+      $("#cjInfo").show();
+      $("#pcInfo").show();
+      
+      $("#donoEqPrev").text(j.dono_equipamento||"");
+      $("#versaoEqPrev").text(j.versao_equipamento||"1");
+      $("#momentoEqPrev").text(j.momento_equipamento||"");
+      
+      $("#donoCjPrev").text(j.dono_conjunto||"");
+      $("#versaoCjPrev").text(j.versao_conjunto||"1");
+      $("#momentoCjPrev").text(j.momento_conjunto||"");
+      
+      $("#donoPcPrev").text(j.dono_peca||"");
+      $("#versaoPcPrev").text(j.versao_peca||"1");
+      $("#momentoPcPrev").text(j.momento_peca||"");
+    }
+    
+    // Oferece para abrir a pasta após cadastro
+    const abrir = confirm("Deseja abrir a pasta agora?");
+    if(abrir){
+      await abrirPasta(j.referencia);
+    }
+  }catch(e){ alert("Cadastrar falhou: " + e); }
+}
+
+async function registrarBase(){
+  try{
+    const tipo = prompt("Registrar o quê? (categoria|modelo|ramo|conjunto|auxiliar|peca)", "categoria");
+    if(!tipo) return;
+
+    const payload = { tipo };
+
+    if(tipo==="categoria"){
+      payload.categoria = prompt("Sigla da categoria (2 chars):", "").trim();
+      payload.codigo_maquina = prompt("Sigla (2 chars):", "").trim();
+    } else if(tipo==="modelo"){
+      payload.categoria = prompt("Sigla da categoria (2 chars):", "").trim(); // ← AQUI ESTAVA ERRADO!
+      payload.modelo = prompt("Modelo (2 chars):", "").trim();
+      payload.descricao = prompt("Descrição do modelo:", "").trim();
+      payload.tipo_modelo = prompt("Tipo do modelo (P/B/O/R):", "P").trim(); // NOVO
+    } else if(tipo==="ramo"){
+      payload.codigo_maquina = prompt("Sigla da categoria (2 chars):", "").trim();
+      payload.modelo = prompt("Modelo (2 chars):", "").trim();
+      payload.tipo = prompt("Ramo (P/B/O/R):", "P");
+    } else if(tipo==="conjunto"){
+      payload.sigla = prompt("Sigla do conjunto (2 chars):", "").trim();
+      payload.nome = prompt("Nome do conjunto:", "");
+      payload.descricao = prompt("Descrição do conjunto:", "");
+    } else if(tipo==="auxiliar"){
+      payload.sigla_conjunto = prompt("Sigla do conjunto (2 chars):", "").trim();
+      payload.sigla_auxiliar = prompt("Sigla auxiliar (1 char):", "").trim();
+      payload.nome = prompt("Nome auxiliar:", "");
+    } else if(tipo==="peca"){
+      payload.sigla = prompt("Sigla da peça (3 chars):", "").trim();
+      payload.nome = prompt("Nome da peça:", "");
+      payload.origem = prompt("Origem padrão (F/C/N):", "F");
+      payload.familia = prompt("Família padrão (F/U/L/O):", "F");
+    } else{
+      alert("Tipo inválido."); return;
+    }
+
+    const j = await apiPost("/api/registrar_base", payload);
+
+    if (j.erro) {
+        alert("❌ " + j.erro);
+    } else {
+        alert("✔ " + (j.sucesso || j.mensagem));
+        await initCombos();
+    }
+  }catch(e){ 
+    alert("Registrar Base falhou: " + e); 
+  }
+}
+
+
+// Funções do Sistema de Peças
+async function carregarInfoSistemaPecas() {
+  try {
+    // Carregar totais
+    const pecas = await apiGet("/api/pecas/listar");
+    const fornecedores = await apiGet("/api/fornecedores/listar");
+    
+    $("#totalPecas").text(pecas.total || 0);
+    $("#totalFornecedores").text(fornecedores.total || 0);
+    
+    // Carregar fornecedores nos selects
+    const fornecedoresList = fornecedores.fornecedores || [];
+    
+    // Selects de fornecedores
+    const $fornecedorSelects = $("#cadFornecedor, #gerenciarFornecedor");
+    $fornecedorSelects.each(function() {
+      const $select = $(this);
+      $select.empty();
+      $select.append(new Option("Selecione um fornecedor", ""));
+      fornecedoresList.forEach(f => {
+        $select.append(new Option(f[1], f[0]));
+      });
+    });
+    
+    // Carregar categorias e materiais para pesquisa
+    const categorias = [...new Set(pecas.pecas.map(p => p.dados.categoria))];
+    const materiais = [...new Set(pecas.pecas.map(p => p.dados.material).filter(m => m))];
+    
+    const $pesquisaCategoria = $("#pesquisaCategoria");
+    $pesquisaCategoria.empty();
+    $pesquisaCategoria.append(new Option("Todas", ""));
+    categorias.forEach(cat => {
+      $pesquisaCategoria.append(new Option(cat, cat));
+    });
+    
+    const $pesquisaMaterial = $("#pesquisaMaterial");
+    $pesquisaMaterial.empty();
+    $pesquisaMaterial.append(new Option("Todos", ""));
+    materiais.forEach(mat => {
+      $pesquisaMaterial.append(new Option(mat, mat));
+    });
+    
+  } catch (e) {
+    console.error("Erro ao carregar informações do sistema de peças:", e);
+  }
+}
+
+async function criarPeca() {
+  try {
+    const nome = $("#pecaNome").val();
+    const categoria = $("#pecaCategoria").val();
+    const material = $("#pecaMaterial").val();
+    const peso = $("#pecaPeso").val();
+    const observacoes = $("#pecaObservacoes").val();
+    
+    if (!nome || !categoria) {
+      alert("Nome e categoria são obrigatórios!");
+      return;
+    }
+    
+    const response = await apiPost("/api/pecas/criar", {
+      nome: nome,
+      categoria: categoria,
+      material: material || null,
+      peso: peso ? parseFloat(peso) : null,
+      observacoes: observacoes
+    });
+    
+    if (response.sucesso) {
+      const $resultado = $("#resultadoCriarPeca");
+      $resultado.html(`
+        <h6>Peça criada com sucesso!</h6>
+        <p><strong>Código Guardian:</strong> ${response.codigo_guardian}</p>
+        <p><strong>Nome:</strong> ${response.dados_peca.nome}</p>
+        <p><strong>Categoria:</strong> ${response.dados_peca.categoria}</p>
+        <p><strong>Data de Criação:</strong> ${new Date(response.dados_peca.data_criacao).toLocaleString()}</p>
+      `);
+      $resultado.show();
+      
+      // Limpar formulário
+      $("#pecaNome").val("");
+      $("#pecaCategoria").val("");
+      $("#pecaMaterial").val("");
+      $("#pecaPeso").val("");
+      $("#pecaObservacoes").val("");
+      
+      // Atualizar informações do sistema
+      carregarInfoSistemaPecas();
+    } else {
+      alert("Erro ao criar peça: " + response.erro);
+    }
+  } catch (e) {
+    alert("Erro ao criar peça: " + e);
+  }
+}
+
+async function adicionarApelido() {
+  try {
+    const codigo_guardian = $("#apelidoGuardian").val();
+    const tipo_apelido = $("#apelidoTipo").val();
+    const diametro = $("#apelidoDiametro").val();
+    const comprimento = $("#apelidoComprimento").val();
+    const norma = $("#apelidoNorma").val();
+    
+    if (!codigo_guardian || !diametro || !comprimento) {
+      alert("Código Guardian, diâmetro e comprimento são obrigatórios!");
+      return;
+    }
+    
+    const payload = {
+      codigo_guardian: codigo_guardian,
+      tipo_apelido: tipo_apelido,
+      diametro: parseFloat(diametro),
+      comprimento: parseFloat(comprimento)
+    };
+    
+    if (tipo_apelido === 'norma') {
+      payload.codigo_norma = norma;
+    } else if (tipo_apelido === '3letras') {
+      payload.sigla = norma;
+    } else if (tipo_apelido === 'descritivo') {
+      payload.descricao = norma;
+    }
+    
+    const response = await apiPost("/api/pecas/adicionar_apelido", payload);
+    
+    if (response.sucesso) {
+      const $resultado = $("#resultadoAdicionarApelido");
+      $resultado.html(`
+        <h6>Apelido adicionado com sucesso!</h6>
+        <p><strong>Código Apelido:</strong> ${response.codigo_apelido}</p>
+        <p><strong>Descrição:</strong> ${response.descricao}</p>
+        <p><strong>Vinculado ao Guardian:</strong> ${codigo_guardian}</p>
+      `);
+      $resultado.show();
+      
+      // Limpar formulário
+      $("#apelidoGuardian").val("");
+      $("#apelidoDiametro").val("");
+      $("#apelidoComprimento").val("");
+      $("#apelidoNorma").val("");
+    } else {
+      alert("Erro ao adicionar apelido: " + response.erro);
+    }
+  } catch (e) {
+    alert("Erro ao adicionar apelido: " + e);
+  }
+}
+
+async function associarFornecedor() {
+  try {
+    const codigo_guardian = $("#fornecedorGuardian").val();
+    const codigo_fornecedor = $("#fornecedorCodigo").val();
+    const codigo_forn_peca = $("#fornecedorPeca").val();
+    const preco = $("#fornecedorPreco").val();
+    const prazo = $("#fornecedorPrazo").val();
+    const nome_fornecedor = $("#fornecedorNome").val();
+    
+    if (!codigo_guardian || !codigo_fornecedor || !codigo_forn_peca) {
+      alert("Código Guardian, código do fornecedor e código da peça no fornecedor são obrigatórios!");
+      return;
+    }
+    
+    // Se informou nome do fornecedor, cadastrar primeiro
+    if (nome_fornecedor) {
+      const cadResponse = await apiPost("/api/fornecedores/cadastrar", {
+        codigo_fornecedor: codigo_fornecedor,
+        nome: nome_fornecedor
+      });
+      
+      if (!cadResponse.sucesso) {
+        alert("Erro ao cadastrar fornecedor: " + cadResponse.erro);
+        return;
+      }
+    }
+    
+    const response = await apiPost("/api/pecas/associar_fornecedor", {
+      codigo_guardian: codigo_guardian,
+      codigo_fornecedor: codigo_fornecedor,
+      codigo_forn_peca: codigo_forn_peca,
+      preco: preco ? parseFloat(preco) : null,
+      prazo: prazo || null
+    });
+    
+    if (response.sucesso) {
+      const $resultado = $("#resultadoAssociarFornecedor");
+      $resultado.html(`
+        <h6>Fornecedor associado com sucesso!</h6>
+        <p><strong>Código Guardian:</strong> ${codigo_guardian}</p>
+        <p><strong>Fornecedor:</strong> ${codigo_fornecedor}</p>
+        <p><strong>Código no Fornecedor:</strong> ${codigo_forn_peca}</p>
+      `);
+      $resultado.show();
+      
+      // Limpar formulário
+      $("#fornecedorGuardian").val("");
+      $("#fornecedorCodigo").val("");
+      $("#fornecedorPeca").val("");
+      $("#fornecedorPreco").val("");
+      $("#fornecedorPrazo").val("");
+      $("#fornecedorNome").val("");
+      
+      // Atualizar informações do sistema
+      carregarInfoSistemaPecas();
+    } else {
+      alert("Erro ao associar fornecedor: " + response.erro);
+    }
+  } catch (e) {
+    alert("Erro ao associar fornecedor: " + e);
+  }
+}
+
+async function pesquisarPecas() {
+  try {
+    const termo = $("#pesquisaTermo").val();
+    const categoria = $("#pesquisaCategoria").val();
+    const material = $("#pesquisaMaterial").val();
+    const data_inicio = $("#pesquisaDataInicio").val();
+    const data_fim = $("#pesquisaDataFim").val();
+    
+    const params = {};
+    if (termo) params.termo = termo;
+    if (categoria) params.categoria = categoria;
+    if (material) params.material = material;
+    if (data_inicio) params.data_inicio = data_inicio;
+    if (data_fim) params.data_fim = data_fim;
+    
+    const response = await apiGet("/api/pecas/pesquisar", params);
+    
+    if (response.sucesso) {
+      const $resultado = $("#resultadoPesquisarPecas");
+      let html = `<h6>Resultados da Pesquisa (${response.total} encontrados)</h6>`;
+      
+      if (response.resultados.length === 0) {
+        html += `<p>Nenhuma peça encontrada com os filtros informados.</p>`;
+      } else {
+        html += `<div class="table-responsive">
+          <table class="table table-sm table-striped">
+            <thead>
+              <tr>
+                <th>Código Guardian</th>
+                <th>Nome</th>
+                <th>Categoria</th>
+                <th>Material</th>
+                <th>Ações</th>
+              </tr>
+            </thead>
+            <tbody>`;
+        
+        response.resultados.forEach(peca => {
+          html += `
+            <tr>
+              <td>${peca.codigo_guardian}</td>
+              <td>${peca.dados.nome}</td>
+              <td>${peca.dados.categoria}</td>
+              <td>${peca.dados.material || '-'}</td>
+              <td>
+                <button class="btn btn-sm btn-outline-primary" onclick="verDetalhesPeca('${peca.codigo_guardian}')">Detalhes</button>
+              </td>
+            </tr>`;
+        });
+        
+        html += `</tbody></table></div>`;
+      }
+      
+      $resultado.html(html);
+      $resultado.show();
+    } else {
+      alert("Erro ao pesquisar peças: " + response.erro);
+    }
+  } catch (e) {
+    alert("Erro ao pesquisar peças: " + e);
+  }
+}
+
+async function buscarPorCodigo() {
+  try {
+    const tipo = $("#buscaTipo").val();
+    const codigo = $("#buscaCodigo").val();
+    const codigo_fornecedor = $("#buscaFornecedor").val();
+    
+    if (!codigo) {
+      alert("Informe o código para busca!");
+      return;
+    }
+    
+    let response;
+    if (tipo === 'fornecedor') {
+      if (!codigo_fornecedor) {
+        alert("Para busca por fornecedor, informe também o código do fornecedor!");
+        return;
+      }
+      response = await apiGet(`/api/pecas/buscar?tipo=fornecedor&codigo=${codigo}&codigo_fornecedor=${codigo_fornecedor}`);
+    } else {
+      response = await apiGet(`/api/pecas/buscar?tipo=${tipo}&codigo=${codigo}`);
+    }
+    
+    if (response.sucesso) {
+      const $resultado = $("#resultadoBuscarPorCodigo");
+      let html = `<h6>Peça Encontrada</h6>`;
+      
+      const peca = response.peca;
+      html += `
+        <p><strong>Código Guardian:</strong> ${peca.codigo_guardian}</p>
+        <p><strong>Nome:</strong> ${peca.dados.nome}</p>
+        <p><strong>Categoria:</strong> ${peca.dados.categoria}</p>
+        <p><strong>Material:</strong> ${peca.dados.material || '-'}</p>
+        <p><strong>Peso:</strong> ${peca.dados.peso ? peca.dados.peso + ' kg' : '-'}</p>
+        <p><strong>Data de Criação:</strong> ${new Date(peca.dados.data_criacao).toLocaleString()}</p>
+        
+        <button class="btn btn-sm btn-outline-primary mt-2" onclick="verDetalhesPeca('${peca.codigo_guardian}')">Ver Detalhes Completos</button>
+      `;
+      
+      $resultado.html(html);
+      $resultado.show();
+    } else {
+      alert("Peça não encontrada: " + response.mensagem);
+    }
+  } catch (e) {
+    alert("Erro ao buscar peça: " + e);
+  }
+}
+
+async function verDetalhesPeca(codigo_guardian) {
+  try {
+    const response = await apiGet(`/api/pecas/informacoes_completas/${codigo_guardian}`);
+    
+    if (response.sucesso) {
+      const info = response.informacoes;
+      const $detalhes = $("#detalhesPeca");
+      
+      let html = `
+        <h6>Detalhes da Peça</h6>
+        <p><strong>Código Guardian:</strong> ${info.codigo_guardian}</p>
+        <p><strong>Nome:</strong> ${info.nome}</p>
+        <p><strong>Categoria:</strong> ${info.categoria}</p>
+        <p><strong>Material:</strong> ${info.material || '-'}</p>
+        <p><strong>Peso:</strong> ${info.peso ? info.peso + ' kg' : '-'}</p>
+        <p><strong>Observações:</strong> ${info.observacoes || '-'}</p>
+        <p><strong>Data de Criação:</strong> ${new Date(info.data_criacao).toLocaleString()}</p>
+      `;
+      
+      // Apelidos
+      if (info.apelidos && info.apelidos.length > 0) {
+        html += `<h6 class="mt-3">Apelidos</h6><ul>`;
+        info.apelidos.forEach(apelido => {
+          html += `<li><strong>${apelido.codigo_apelido}</strong> - ${apelido.descricao} (${apelido.tipo})</li>`;
+        });
+        html += `</ul>`;
+      }
+      
+      // Fornecedores
+      if (info.fornecedores && info.fornecedores.length > 0) {
+        html += `<h6 class="mt-3">Fornecedores</h6><ul>`;
+        info.fornecedores.forEach(fornecedor => {
+          html += `
+            <li>
+              <strong>${fornecedor.nome_fornecedor}</strong> (${fornecedor.codigo_fornecedor})
+              <br>Código: ${fornecedor.codigo_peca}
+              ${fornecedor.preco ? `<br>Preço: R$ ${fornecedor.preco}` : ''}
+              ${fornecedor.prazo ? `<br>Prazo: ${fornecedor.prazo}` : ''}
+            </li>`;
+        });
+        html += `</ul>`;
+      }
+      
+      $detalhes.html(html);
+    } else {
+      alert("Erro ao obter detalhes da peça: " + response.mensagem);
+    }
+  } catch (e) {
+    alert("Erro ao obter detalhes da peça: " + e);
+  }
+}
+
+async function cadastrarFornecedor() {
+  try {
+    const codigo_fornecedor = $("#novoFornecedorCodigo").val();
+    const nome = $("#novoFornecedorNome").val();
+    const contato = $("#novoFornecedorContato").val();
+    const email = $("#novoFornecedorEmail").val();
+    const telefone = $("#novoFornecedorTelefone").val();
+    const endereco = $("#novoFornecedorEndereco").val();
+    
+    if (!codigo_fornecedor || !nome) {
+      alert("Código e nome do fornecedor são obrigatórios!");
+      return;
+    }
+    
+    const response = await apiPost("/api/fornecedores/cadastrar", {
+      codigo_fornecedor: codigo_fornecedor,
+      nome: nome,
+      contato: contato || null,
+      email: email || null,
+      telefone: telefone || null,
+      endereco: endereco || null
+    });
+    
+    if (response.sucesso) {
+      const $resultado = $("#resultadoCadastrarFornecedor");
+      $resultado.html(`
+        <h6>Fornecedor cadastrado com sucesso!</h6>
+        <p><strong>Código:</strong> ${codigo_fornecedor}</p>
+        <p><strong>Nome:</strong> ${nome}</p>
+      `);
+      $resultado.show();
+      
+      // Limpar formulário
+      $("#novoFornecedorCodigo").val("");
+      $("#novoFornecedorNome").val("");
+      $("#novoFornecedorContato").val("");
+      $("#novoFornecedorEmail").val("");
+      $("#novoFornecedorTelefone").val("");
+      $("#novoFornecedorEndereco").val("");
+      
+      // Atualizar informações do sistema
+      carregarInfoSistemaPecas();
+    } else {
+      alert("Erro ao cadastrar fornecedor: " + response.erro);
+    }
+  } catch (e) {
+    alert("Erro ao cadastrar fornecedor: " + e);
+  }
+}
+
+async function listarFornecedores() {
+  try {
+    const response = await apiGet("/api/fornecedores/listar");
+    
+    if (response.sucesso) {
+      const $resultado = $("#resultadoListarFornecedores");
+      let html = `<h6>Fornecedores Cadastrados (${response.total})</h6>`;
+      
+      if (response.fornecedores.length === 0) {
+        html += `<p>Nenhum fornecedor cadastrado.</p>`;
+      } else {
+        html += `<div class="table-responsive">
+          <table class="table table-sm table-striped">
+            <thead>
+              <tr>
+                <th>Código</th>
+                <th>Nome</th>
+                <th>Contato</th>
+                <th>Email</th>
+                <th>Telefone</th>
+              </tr>
+            </thead>
+            <tbody>`;
+        
+        response.fornecedores.forEach(fornecedor => {
+          html += `
+            <tr>
+              <td>${fornecedor[0]}</td>
+              <td>${fornecedor[1]}</td>
+              <td>${fornecedor[2] || '-'}</td>
+              <td>${fornecedor[3] || '-'}</td>
+              <td>${fornecedor[4] || '-'}</td>
+            </tr>`;
+        });
+        
+        html += `</tbody></table></div>`;
+      }
+      
+      $resultado.html(html);
+      $resultado.show();
+    } else {
+      alert("Erro ao listar fornecedores: " + response.erro);
+    }
+  } catch (e) {
+    alert("Erro ao listar fornecedores: " + e);
+  }
+}
+
+// Funções do CAD
+async function carregarInfoCAD() {
+  try {
+    // Carregar totais
+    const relatorio = await apiGet("/api/cad/relatorio");
+    
+    if (relatorio.sucesso) {
+      $("#totalCADs").text(relatorio.relatorio.total_cads || 0);
+      $("#cadsAprovados").text(relatorio.relatorio.por_status.APROVADO || 0);
+      $("#cadsVencidos").text(relatorio.relatorio.vencidos || 0);
+      $("#cadsVencendo").text(relatorio.relatorio.proximos_vencer || 0);
+    }
+    
+    // Carregar CADs para selects
+    const fornecedores = await apiGet("/api/fornecedores/listar");
+    const fornecedoresList = fornecedores.fornecedores || [];
+    
+    // Carregar CADs por fornecedor
+    const $docCAD = $("#docCAD");
+    const $atualizarCAD = $("#atualizarCAD");
+    
+    $docCAD.empty();
+    $docCAD.append(new Option("Selecione um CAD", ""));
+    
+    $atualizarCAD.empty();
+    $atualizarCAD.append(new Option("Selecione um CAD", ""));
+    
+    for (const fornecedor of fornecedoresList) {
+      const cadsResponse = await apiGet(`/api/cad/fornecedor/${fornecedor[0]}`);
+      
+      if (cadsResponse.sucesso) {
+        cadsResponse.certificados.forEach(cad => {
+          const optionText = `${fornecedor[1]} - ${cad.numero_cad} (${cad.status})`;
+          const optionValue = cad.id;
+          
+          $docCAD.append(new Option(optionText, optionValue));
+          $atualizarCAD.append(new Option(optionText, optionValue));
+        });
+      }
+    }
+    
+  } catch (e) {
+    console.error("Erro ao carregar informações do CAD:", e);
+  }
+}
+
+async function cadastrarCAD() {
+  try {
+    const codigo_fornecedor = $("#cadFornecedor").val();
+    const numero_cad = $("#cadNumero").val();
+    const data_emissao = $("#cadEmissao").val();
+    const data_validade = $("#cadValidade").val();
+    const escopo = $("#cadEscopo").val();
+    const observacoes = $("#cadObservacoes").val();
+    
+    if (!codigo_fornecedor || !numero_cad || !data_emissao || !data_validade || !escopo) {
+      alert("Fornecedor, número CAD, datas e escopo são obrigatórios!");
+      return;
+    }
+    
+    const response = await apiPost("/api/cad/cadastrar", {
+      codigo_fornecedor: codigo_fornecedor,
+      numero_cad: numero_cad,
+      data_emissao: data_emissao,
+      data_validade: data_validade,
+      escopo: escopo,
+      observacoes: observacoes
+    });
+    
+    if (response.sucesso) {
+      const $resultado = $("#resultadoCadastrarCAD");
+      $resultado.html(`
+        <h6>CAD cadastrado com sucesso!</h6>
+        <p><strong>Número CAD:</strong> ${response.certificado.numero_cad}</p>
+        <p><strong>Status:</strong> ${response.certificado.status}</p>
+        <p><strong>Data de Validade:</strong> ${new Date(response.certificado.data_validade).toLocaleDateString()}</p>
+        <p><strong>Escopo:</strong> ${response.certificado.escopo}</p>
+      `);
+      $resultado.show();
+      
+      // Limpar formulário
+      $("#cadNumero").val("");
+      $("#cadEmissao").val("");
+      $("#cadValidade").val("");
+      $("#cadEscopo").val("");
+      $("#cadObservacoes").val("");
+      
+      // Atualizar informações do CAD
+      carregarInfoCAD();
+    } else {
+      alert("Erro ao cadastrar CAD: " + response.erro);
+    }
+  } catch (e) {
+    alert("Erro ao cadastrar CAD: " + e);
+  }
+}
+
+async function adicionarDocumento() {
+  try {
+    const id_certificado = $("#docCAD").val();
+    const tipo_documento = $("#docTipo").val();
+    const nome_arquivo = $("#docNome").val();
+    const caminho_arquivo = $("#docCaminho").val();
+    const observacoes = $("#docObservacoes").val();
+    
+    if (!id_certificado || !tipo_documento || !nome_arquivo || !caminho_arquivo) {
+      alert("CAD, tipo, nome e caminho são obrigatórios!");
+      return;
+    }
+    
+    const response = await apiPost("/api/cad/adicionar_documento", {
+      id_certificado: parseInt(id_certificado),
+      tipo_documento: tipo_documento,
+      nome_arquivo: nome_arquivo,
+      caminho_arquivo: caminho_arquivo,
+      observacoes: observacoes
+    });
+    
+    if (response.sucesso) {
+      const $resultado = $("#resultadoAdicionarDocumento");
+      $resultado.html(`
+        <h6>Documento adicionado com sucesso!</h6>
+        <p><strong>Tipo:</strong> ${response.documento.tipo}</p>
+        <p><strong>Nome:</strong> ${response.documento.nome_arquivo}</p>
+        <p><strong>Data de Upload:</strong> ${new Date(response.documento.data_upload).toLocaleString()}</p>
+      `);
+      $resultado.show();
+      
+      // Limpar formulário
+      $("#docNome").val("");
+      $("#docCaminho").val("");
+      $("#docObservacoes").val("");
+    } else {
+      alert("Erro ao adicionar documento: " + response.erro);
+    }
+  } catch (e) {
+    alert("Erro ao adicionar documento: " + e);
+  }
+}
+
+async function listarCADs() {
+  try {
+    const codigo_fornecedor = $("#gerenciarFornecedor").val();
+    const status = $("#gerenciarStatus").val();
+    
+    let response;
+    if (codigo_fornecedor) {
+      response = await apiGet(`/api/cad/fornecedor/${codigo_fornecedor}`);
+    } else {
+      // Se não selecionou fornecedor, buscar todos
+      response = await apiGet("/api/cad/relatorio");
+      
+      if (response.sucesso) {
+        // Transformar o relatório em lista de CADs
+        const todosCADs = [];
+        
+        // Buscar CADs de cada fornecedor
+        const fornecedores = await apiGet("/api/fornecedores/listar");
+        
+        for (const fornecedor of fornecedores.fornecedores) {
+          const cadsResponse = await apiGet(`/api/cad/fornecedor/${fornecedor[0]}`);
+          
+          if (cadsResponse.sucesso) {
+            cadsResponse.certificados.forEach(cad => {
+              // Filtrar por status se necessário
+              if (!status || cad.status === status) {
+                todosCADs.push({
+                  ...cad,
+                  nome_fornecedor: fornecedor[1]
+                });
+              }
+            });
+          }
+        }
+        
+        response = {
+          sucesso: true,
+          certificados: todosCADs
+        };
+      }
+    }
+    
+    if (response.sucesso) {
+      const $resultado = $("#resultadoListarCADs");
+      let html = `<h6>CADs Encontrados</h6>`;
+      
+      if (response.certificados.length === 0) {
+        html += `<p>Nenhum CAD encontrado com os filtros informados.</p>`;
+      } else {
+        html += `<div class="table-responsive">
+          <table class="table table-sm table-striped">
+            <thead>
+              <tr>
+                <th>Número CAD</th>
+                <th>Fornecedor</th>
+                <th>Status</th>
+                <th>Data de Validade</th>
+                <th>Escopo</th>
+                <th>Ações</th>
+              </tr>
+            </thead>
+            <tbody>`;
+        
+        response.certificados.forEach(cad => {
+          let statusClass = "bg-secondary";
+          if (cad.status === "Aprovado") statusClass = "bg-success";
+          else if (cad.status === "Pendente") statusClass = "bg-warning";
+          else if (cad.status === "Reprovado") statusClass = "bg-danger";
+          else if (cad.status === "Vencido") statusClass = "bg-danger";
+          
+          html += `
+            <tr>
+              <td>${cad.numero_cad}</td>
+              <td>${cad.nome_fornecedor || cad.codigo_fornecedor}</td>
+              <td><span class="badge ${statusClass}">${cad.status}</span></td>
+              <td>${new Date(cad.data_validade).toLocaleDateString()}</td>
+              <td>${cad.escopo}</td>
+              <td>
+                <button class="btn btn-sm btn-outline-primary" onclick="verDetalhesCAD(${cad.id})">Detalhes</button>
+              </td>
+            </tr>`;
+        });
+        
+        html += `</tbody></table></div>`;
+      }
+      
+      $resultado.html(html);
+      $resultado.show();
+    } else {
+      alert("Erro ao listar CADs: " + response.erro);
+    }
+  } catch (e) {
+    alert("Erro ao listar CADs: " + e);
+  }
+}
+
+async function verificarValidade() {
+  try {
+    const response = await apiGet("/api/cad/verificar_validade");
+    
+    if (response.sucesso) {
+      alert(`${response.vencidos} CADs foram marcados como vencidos.`);
+      
+      // Atualizar informações do CAD
+      carregarInfoCAD();
+    } else {
+      alert("Erro ao verificar validade: " + response.erro);
+    }
+  } catch (e) {
+    alert("Erro ao verificar validade: " + e);
+  }
+}
+
+async function atualizarStatus() {
+  try {
+    const id_certificado = $("#atualizarCAD").val();
+    const novo_status = $("#novoStatus").val();
+    
+    if (!id_certificado || !novo_status) {
+      alert("Selecione um CAD e o novo status!");
+      return;
+    }
+    
+    const response = await apiPost("/api/cad/atualizar_status", {
+      id_certificado: parseInt(id_certificado),
+      novo_status: novo_status
+    });
+    
+    if (response.sucesso) {
+      alert("Status atualizado com sucesso!");
+      
+      // Atualizar informações do CAD
+      carregarInfoCAD();
+    } else {
+      alert("Erro ao atualizar status: " + response.erro);
+    }
+  } catch (e) {
+    alert("Erro ao atualizar status: " + e);
+  }
+}
+
+async function verDetalhesCAD(id_certificado) {
+  try {
+    // Buscar detalhes do CAD
+    const fornecedores = await apiGet("/api/fornecedores/listar");
+    
+    let cadDetalhes = null;
+    
+    // Buscar em todos os fornecedores
+    for (const fornecedor of fornecedores.fornecedores) {
+      const cadsResponse = await apiGet(`/api/cad/fornecedor/${fornecedor[0]}`);
+      
+      if (cadsResponse.sucesso) {
+        const cad = cadsResponse.certificados.find(c => c.id === id_certificado);
+        if (cad) {
+          cadDetalhes = {
+            ...cad,
+            nome_fornecedor: fornecedor[1]
+          };
+          break;
+        }
+      }
+    }
+    
+    if (cadDetalhes) {
+      const $detalhes = $("#detalhesCAD");
+      
+      let statusClass = "bg-secondary";
+      if (cadDetalhes.status === "Aprovado") statusClass = "bg-success";
+      else if (cadDetalhes.status === "Pendente") statusClass = "bg-warning";
+      else if (cadDetalhes.status === "Reprovado") statusClass = "bg-danger";
+      else if (cadDetalhes.status === "Vencido") statusClass = "bg-danger";
+      
+      let html = `
+        <h6>Detalhes do CAD</h6>
+        <p><strong>Número CAD:</strong> ${cadDetalhes.numero_cad}</p>
+        <p><strong>Fornecedor:</strong> ${cadDetalhes.nome_fornecedor}</p>
+        <p><strong>Status:</strong> <span class="badge ${statusClass}">${cadDetalhes.status}</span></p>
+        <p><strong>Data de Emissão:</strong> ${new Date(cadDetalhes.data_emissao).toLocaleDateString()}</p>
+        <p><strong>Data de Validade:</strong> ${new Date(cadDetalhes.data_validade).toLocaleDateString()}</p>
+        <p><strong>Escopo:</strong> ${cadDetalhes.escopo}</p>
+        <p><strong>Observações:</strong> ${cadDetalhes.observacoes || '-'}</p>
+      `;
+      
+      // Documentos
+      if (cadDetalhes.documentos && cadDetalhes.documentos.length > 0) {
+        html += `<h6 class="mt-3">Documentos</h6><ul>`;
+        cadDetalhes.documentos.forEach(doc => {
+          html += `
+            <li>
+              <strong>${doc.tipo}</strong> - ${doc.nome_arquivo}
+              <br>Data de Upload: ${new Date(doc.data_upload).toLocaleString()}
+            </li>`;
+        });
+        html += `</ul>`;
+      }
+      
+      $detalhes.html(html);
+    } else {
+      alert("CAD não encontrado!");
+    }
+  } catch (e) {
+    alert("Erro ao obter detalhes do CAD: " + e);
+  }
+}
+
+async function gerarRelatorio() {
+  try {
+    const response = await apiGet("/api/cad/relatorio");
+    
+    if (response.sucesso) {
+      const $resultado = $("#resultadoRelatorioCAD");
+      const relatorio = response.relatorio;
+      
+      let html = `
+        <h6>Relatório Geral de CADs</h6>
+        <p><strong>Total de CADs:</strong> ${relatorio.total_cads}</p>
+        <p><strong>Fornecedores com CAD:</strong> ${relatorio.fornecedores_com_cad}</p>
+        <p><strong>CADs Vencidos:</strong> ${relatorio.vencidos}</p>
+        <p><strong>CADs Vencendo (30 dias):</strong> ${relatorio.proximos_vencer}</p>
+        
+        <h6 class="mt-3">Por Status</h6>
+        <ul>`;
+      
+      for (const [status, count] of Object.entries(relatorio.por_status)) {
+        html += `<li><strong>${status}:</strong> ${count}</li>`;
+      }
+      
+      html += `</ul>`;
+      
+      $resultado.html(html);
+      $resultado.show();
+    } else {
+      alert("Erro ao gerar relatório: " + response.erro);
+    }
+  } catch (e) {
+    alert("Erro ao gerar relatório: " + e);
+  }
+}
+
+async function listarVencendo() {
+  try {
+    const dias = prompt("Listar CADs que vencerão em quantos dias?", "30");
+    if (!dias) return;
+    
+    const response = await apiGet(`/api/cad/vencendo?dias=${dias}`);
+    
+    if (response.sucesso) {
+      const $resultado = $("#resultadoRelatorioCAD");
+      let html = `<h6>CADs Vencendo nos Próximos ${dias} Dias (${response.total})</h6>`;
+      
+      if (response.cads_vencendo.length === 0) {
+        html += `<p>Nenhum CAD vencendo no período.</p>`;
+      } else {
+        html += `<div class="table-responsive">
+          <table class="table table-sm table-striped">
+            <thead>
+              <tr>
+                <th>Número CAD</th>
+                <th>Fornecedor</th>
+                <th>Data de Validade</th>
+                <th>Dias Restantes</th>
+              </tr>
+            </thead>
+            <tbody>`;
+        
+        const hoje = new Date();
+        hoje.setHours(0, 0, 0, 0);
+        
+        response.cads_vencendo.forEach(cad => {
+          const dataValidade = new Date(cad.data_validade);
+          const diffTime = dataValidade - hoje;
+          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+          
+          html += `
+            <tr>
+              <td>${cad.numero_cad}</td>
+              <td>${cad.nome}</td>
+              <td>${dataValidade.toLocaleDateString()}</td>
+              <td>${diffDays} dias</td>
+            </tr>`;
+        });
+        
+        html += `</tbody></table></div>`;
+      }
+      
+      $resultado.html(html);
+      $resultado.show();
+    } else {
+      alert("Erro ao listar CADs vencendo: " + response.erro);
+    }
+} catch (e) {
+    alert("Erro ao listar CADs vencendo: " + e);
+  }
+}
+
+// ============================================================
+//  INICIALIZAÇÃO PRINCIPAL DO SISTEMA
+// ============================================================ 
+</script>
+
+<script>
+
+$(async function () {
+
+    // Atualizar indicador de modo
+    if (HAS_NOVAS_COLUNAS) {
+        $("#modoSistema").text("Modo Avançado (com controle de Dono/Versão/Momento)").css("color", "green");
+    } else {
+        $("#modoSistema").text("Modo Básico (v3.0 original)").css("color", "orange");
+    }
+
+    // -------- Guardian Web --------
+    await initCombos();
+    $("#categoria").on("change", async ()=> await loadModelos());
+    $("#modelo").on("change", async ()=> await loadRamos());
+    $("#conjunto").on("change", async ()=> await loadAuxiliares());
+
+    $("#btnPreview").on("click", preview);
+    $("#btnPesquisar").on("click", pesquisar);
+    $("#btnPesquisarAvancada").on("click", pesquisarAvancada);
+    $("#btnDecompor").on("click", decomporReferencia);
+    $("#btnCadastrar").on("click", cadastrar);
+    $("#btnRegistrar").on("click", registrarBase);
+
+    // -------- Sistema de Peças --------
+    await carregarInfoSistemaPecas();
+
+    $("#btnCriarPeca").on("click", criarPeca);
+    $("#btnAdicionarApelido").on("click", adicionarApelido);
+    $("#btnAssociarFornecedor").on("click", associarFornecedor);
+    $("#btnPesquisarPecas").on("click", pesquisarPecas);
+    $("#btnBuscarPorCodigo").on("click", buscarPorCodigo);
+    $("#btnCadastrarFornecedor").on("click", cadastrarFornecedor);
+    $("#btnListarFornecedores").on("click", listarFornecedores);
+
+    // -------- CAD --------
+    await carregarInfoCAD();
+
+    $("#btnCadastrarCAD").on("click", cadastrarCAD);
+    $("#btnAdicionarDocumento").on("click", adicionarDocumento);
+    $("#btnListarCADs").on("click", listarCADs);
+    $("#btnVerificarValidade").on("click", verificarValidade);
+    $("#btnAtualizarStatus").on("click", atualizarStatus);
+    $("#btnGerarRelatorio").on("click", gerarRelatorio);
+    $("#btnListarVencendo").on("click", listarVencendo);
+
+});
+</script>
+
+<!-- ============================================================ -->
+<!--  RESET DOS FILTROS — SOMENTE MODO PESQUISAR                   -->
+<!-- ============================================================ -->
+<script>
+function resetarFiltrosGuardian() {
+    console.log("🧹 Resetando filtros visíveis (modo Pesquisar)");
+
+    const guardian = document.getElementById("guardian");
+    if (!guardian) return;
+
+    // 1) Limpa inputs texto, número e textarea visíveis
+    guardian.querySelectorAll("input[type='text'], input[type='number'], textarea")
+        .forEach(el => {
+            if (el.offsetParent !== null) el.value = "";
+        });
+
+    // 2) Limpa IDs manualmente (IDs reais)
+    ["id_eq", "id_cj", "id_peca"].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.value = "";
+    });
+
+    // 3) Limpa selects
+    guardian.querySelectorAll("select")
+        .forEach(sel => {
+            if (sel.offsetParent !== null) {
+                sel.selectedIndex = 0;
+                if (window.$) $(sel).val("").change();
+            }
+        });
+
+    // 4) Limpa prévias
+    document.querySelectorAll(".preview-field")
+        .forEach(el => el.textContent = "");
+
+    // 5) Limpa resultados da tabela
+    const tabela = document.getElementById("tabelaResultados");
+    if (tabela) tabela.innerHTML = "";
+
+    console.log("✔ Filtros resetados com sucesso");
+}
+
+// Somente quando mudar para modo Pesquisar
+document.addEventListener("DOMContentLoaded", () => {
+    const modoPesq = document.getElementById("modo_pesq");
+    if (modoPesq) {
+        modoPesq.addEventListener("change", () => {
+            if (modoPesq.checked) resetarFiltrosGuardian();
+        });
+    }
+});
+</script>
+
+</script>
+{% endraw %}
+</body>
+</html>
+"""
+
+
+LOGIN_HTML = r"""<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<title>Guardian Web {{versao}} - Login</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet"
+ href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+<style>
+body { background:#f7fafc; color:#1a202c; }
+.card { background:#ffffff; border:1px solid #e2e8f0; max-width:420px; margin:10vh auto; }
+.form-control { background:#ffffff; color:#1a202c; border-color:#cbd5e0; }
+.btn-primary { background:#2563eb; border:0; }
+</style>
+</head>
+<body>
+<div class="card p-4">
+  <h3 class="mb-3">Guardian Web <span class="badge text-bg-secondary">v{{versao}}</span></h3>
+  {% if erro %}<div class="alert alert-danger">{{erro}}</div>{% endif %}
+  <form method="post" action="/login">
+    <div class="mb-2">
+      <label class="form-label">Nome</label>
+      <input class="form-control" name="nome" required>
+    </div>
+    <div class="mb-3">
+      <label class="form-label">Senha</label>
+      <input class="form-control" type="password" name="senha" required>
+    </div>
+    <button class="btn btn-primary w-100">Entrar</button>
+  </form>
+</div>
+</body>
+</html>
+"""
+
+# ---------------------------
+# Inicialização do Sistema de Peças
+# ---------------------------
+sistema_pecas = SistemaCodificacaoPecas()
+
+# ---------------------------
+# Verificação de recursos disponíveis
+# ---------------------------
+def check_available_features():
+    """Verifica quais recursos estão disponíveis no banco de dados"""
+    features = {
+        'has_novas_colunas': False,
+        'has_auditoria': False,
+        'has_steeltabel_completo': False
+    }
+    
+    try:
+        # Verificar colunas de controle
+        features['has_novas_colunas'] = (
+            has_column('keystone', 'dono_atual') and
+            has_column('keystone', 'versao_atual') and
+            has_column('keystone', 'momento_atual') and
+            has_column('conjuntos', 'dono_atual') and
+            has_column('conjuntos', 'versao_atual') and
+            has_column('conjuntos', 'momento_atual') and
+            has_column('pecas', 'dono_atual') and
+            has_column('pecas', 'versao_atual') and
+            has_column('pecas', 'momento_atual')
+        )
+        
+        # Verificar tabela de auditoria
+        features['has_auditoria'] = (
+            has_column('auditoria', 'referencia') and
+            has_column('auditoria', 'fase') and
+            has_column('auditoria', 'acao')
+        )
+        
+        # Verificar tabela steeltabel completa (baseado na estrutura real)
+        features['has_steeltabel_completo'] = (
+            has_column('steeltabel', 'tipo_origem') and
+            has_column('steeltabel', 'data_criacao') and
+            has_column('steeltabel', 'status_referencia')
+        )
+        
+    except Exception as e:
+        logger.error(f"Erro ao verificar recursos: {e}")
+    
+    return features
+# ---------------------------
+# Função: Registrar Base no Banco
+# ---------------------------
+def registrar_base(cur, conn, payload, tipo):
+    print("\n=== registrar_base() INICIO ===")
+    print("tipo:", tipo)
+    print("payload:", payload)
+
+    try:
+        # =============================
+        # REGISTRO DE CATEGORIA
+        # =============================
+        if tipo == "categoria":
+            categoria = payload.get("categoria")
+            codigo = payload.get("codigo_maquina")
+
+            print("[CATEGORIA] categoria:", categoria, "codigo:", codigo)
+
+            if not categoria or not codigo:
+                return {"erro": "Categoria e Código da máquina são obrigatórios."}
+
+            # Verificar duplicidade na keystone
+            cur.execute("SELECT 1 FROM keystone WHERE codigo_maquina = %s", (codigo,))
+            if cur.fetchone():
+                return {"erro": f"O código '{codigo}' já está registrado."}
+
+            # Inserir na keystone
+            cur.execute("""
+                INSERT INTO keystone (codigo_maquina, categoria)
+                VALUES (%s, %s)
+            """, (codigo, categoria))
+
+            # Atualizar / inserir na tabela categorias
+            cur.execute("""
+                INSERT INTO categorias (sigla, categoria)
+                VALUES (%s, %s)
+                ON DUPLICATE KEY UPDATE categoria = VALUES(categoria)
+            """, (codigo, categoria))
+
+            print("[CATEGORIA] Inserida e sincronizada com sucesso.")
+            return {"sucesso": f"Categoria '{categoria}' registrada e sincronizada com sucesso!"}
+
+        # =============================
+        # REGISTRO DE MODELO
+        # =============================
+        elif tipo == "modelo":
+            modelo = payload.get("modelo")
+            categoria_sigla = payload.get("categoria")  # Ex: "ID"
+            descricao = payload.get("descricao")
+
+            print("[MODELO] modelo:", modelo, "categoria:", categoria_sigla, "descricao:", descricao)
+
+            # Tipo de registro → P/B/O/R
+            tipo_registro = payload.get("tipo_modelo")
+            if not tipo_registro:
+                tipo_registro = "P"  # valor padrão
+            else:
+                tipo_registro = tipo_registro.strip()[:1]  # garante 1 caractere
+
+            # Validação
+            if not modelo or not categoria_sigla:
+                return {"erro": "Modelo e Categoria são obrigatórios."}
+
+            # Verificar categoria existente
+            cur.execute("SELECT id FROM categorias WHERE sigla = %s", (categoria_sigla,))
+            cat_row = cur.fetchone()
+            if not cat_row:
+                return {"erro": f"Categoria '{categoria_sigla}' não existe."}
+            categoria_id = cat_row["id"]
+
+            # Verificar duplicidade na keystone
+            cur.execute("""
+                SELECT 1 FROM keystone
+                WHERE codigo_maquina = %s AND modelo = %s
+            """, (categoria_sigla, modelo))
+            if cur.fetchone():
+                return {"erro": f"O modelo '{modelo}' já está registrado para a categoria '{categoria_sigla}'."}
+
+            # Verificar se existe na tabela maquinas (opcional)
+            cur.execute("SELECT id FROM maquinas WHERE sigla = %s", (categoria_sigla,))
+            maq_row = cur.fetchone()
+            id_maquina = maq_row["id"] if maq_row else 0
+
+            # Inserir na keystone
+            cur.execute("""
+                INSERT INTO keystone (codigo_maquina, modelo, descricao, tipo)
+                VALUES (%s, %s, %s, %s)
+            """, (categoria_sigla, modelo, descricao or "Modelo genérico", tipo_registro))
+
+            # Inserir também na tabela modelos
+            cur.execute("""
+                INSERT INTO modelos (id_maquina, nome, descricao)
+                VALUES (%s, %s, %s)
+            """, (id_maquina, modelo, descricao or None))
+
+            print("[MODELO] Registro concluído com sucesso.")
+            return {"sucesso": f"Modelo '{modelo}' registrado com sucesso para '{categoria_sigla}'!"}
+
+        # =============================
+        # TIPOS NÃO TRATADOS
+        # =============================
+        else:
+            return {"erro": f"Tipo '{tipo}' não suportado para registro."}
+
+    except Exception as e:
+        print("[ERRO registrar_base]", type(e), e)
+        return {"erro": f"Erro interno na função registrar_base: {str(e)}"}
+
+# ---------------------------
+# API: Registrar Base
+# ---------------------------
+@app.route('/api/registrar_base', methods=['POST'])
+def registrar_base_route():
+    try:
+        payload = request.get_json()
+        tipo = payload.get("tipo")  # ex: "categoria"
+
+        conn = db_mysql()   # <-- AQUI É CRIADO O 'conn' CORRETAMENTE
+        cur = conn.cursor()
+
+        resultado = registrar_base(cur, conn, payload, tipo)
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify(resultado)
+    except Exception as e:
+        print(f"❌ Erro registrar base: {e}")
+        return jsonify({"erro": f"Erro interno no servidor: {str(e)}"}), 500
+
+
+
+# ---------------------------
+# Execução da Aplicação
+# ---------------------------
+if __name__ == "__main__":
+    print(f"🚀 Iniciando Guardian Web v{APP_VERSION}")
+    print("📦 Sistema de Codificação de Peças Integrado")
+
+    try:
+        app.run(host=HOST, port=PORT, debug=False)
+    except Exception as e:
+        print("\n❌ ERRO AO INICIAR A APLICAÇÃO:")
+        print(e)  # Exibe o erro real na tela
+        input("\n🔎 Pressione ENTER para fechar...")
+    finally:
+        try:
+            sistema_pecas.close()
+        except:
+            pass
